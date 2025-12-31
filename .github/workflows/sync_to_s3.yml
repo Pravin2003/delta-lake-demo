@@ -4,7 +4,6 @@ on:
         branches: ["main"]
         paths:
             - 'data/**/*.csv'
-    workflow_dispatch:
 
 jobs:
   deploy:
@@ -22,4 +21,4 @@ jobs:
 
       - name: Upload CSV to S3
         run: |
-            aws s3 sync data s3://${{ secrets.S3_BUCKET_NAME }} --exclude "*" --include "*.csv" --acl public-read
+            aws s3 sync data s3://${{ secrets.S3_BUCKET_NAME }}/raw --exclude "*" --include "*.csv"
