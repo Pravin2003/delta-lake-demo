@@ -1,0 +1,26 @@
+name: Upload CSV to S3
+on:
+    push:
+        branches: ["main"]
+        paths:
+            - 'data/**/*.csv'
+    workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+            aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+            aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+            aws-region: ${{ secrets.AWS_REGION }}
+            aws-s3-bucket-name: ${{ secrets.S3_BUCKET_NAME }}
+
+      - name: Upload CSV to S3
+        run: |
+            aws s3 sync data s3://delta-lake-demo-pravin --exclude "*" --include "*.csv" --acl public-read
