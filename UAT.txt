@@ -1,0 +1,2548 @@
+# Databricks notebook source
+# MAGIC %pip install openpyxl
+
+# COMMAND ----------
+
+# MAGIC %restart_python
+
+# COMMAND ----------
+
+#============================================
+# CELL 1: PRODUCTION UAT CONFIGURATION
+# ============================================
+
+from pyspark.sql import functions as F
+from pyspark.sql.types import *
+from datetime import datetime, timedelta
+import pandas as pd
+from openpyxl.styles import Alignment, Border, Side, PatternFill, Font
+from openpyxl.utils import get_column_letter
+import json
+
+# ============================================
+# 1. BASIC CONFIGURATION
+# ============================================
+
+VIEWS_TO_TEST = [
+    'customer_orders_summary',
+    'daily_sales_summary',
+    'product_performance',
+    'regional_performance',
+    'payment_method_analysis',
+    'customer_segment_analysis',
+    'store_performance_ranking',
+    'transaction_details_enriched',
+    'monthly_revenue_trends',
+    'discount_impact_analysis',
+    'employee_sales_performance',
+    'status_breakdown_by_day',
+    'tax_summary_by_region',
+    'shipping_cost_analysis'
+]
+
+# Source and Target Systems
+REDSHIFT_CATALOG = 'test_redshift'
+REDSHIFT_SCHEMA = 'dw_rptvws'
+DATABRICKS_CATALOG = 'test_databricks'
+DATABRICKS_SCHEMA = 'digital_gld'
+
+# Test Date Range
+START_DATE = '2026-01-01'
+END_DATE = (datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d')
+
+# ============================================
+# 2. DATE COLUMNS CONFIGURATION
+# Used in Step 7 (Row Count) and Step 8 (Business Metrics)
+# Specify date column for filtering test data
+# Set to None if view has no date column or no filter needed
+# Can be single column name, list of columns, or None
+# ============================================
+
+DATE_COLUMNS = {
+    'customer_orders_summary': 'last_order_date',
+    'daily_sales_summary': 'transaction_date',
+    'product_performance': None,  # No date column
+    'regional_performance': None,  # No date column
+    'payment_method_analysis': None,  # No date column
+    'customer_segment_analysis': None,  # No date column
+    'store_performance_ranking': None,  # No date column
+    'transaction_details_enriched': 'transaction_date',
+    'monthly_revenue_trends': 'month',
+    'discount_impact_analysis': 'transaction_date',
+    'employee_sales_performance': None,  # No date column
+    'status_breakdown_by_day': 'transaction_date',  # Note: renamed to txn_date in Databricks
+    'tax_summary_by_region': None,  # No date column
+    'shipping_cost_analysis': None  # No date column
+}
+
+# ============================================
+# 3. BUSINESS METRICS CONFIGURATION
+# Used in Step 8 (Business Metrics Validation)
+# List numeric columns to validate with SUM, AVG, MIN, MAX, COUNT DISTINCT
+# IMPORTANT: Use Redshift column names - script will handle mapping to Databricks
+# Can be empty list [] if no metrics defined
+# ============================================
+
+BUSINESS_METRICS = {
+    'customer_orders_summary': [
+        'order_count', 
+        'total_spent', 
+        'avg_order_value'
+    ],
+    'daily_sales_summary': [
+        'transaction_count', 
+        'daily_revenue', 
+        'avg_transaction', 
+        'total_quantity', 
+        'unique_customers'
+    ],
+    'product_performance': [
+        'sales_count', 
+        'total_revenue', 
+        'total_units_sold', 
+        'avg_price', 
+        'gross_margin'
+    ],
+    'regional_performance': [
+        'transaction_count',         # Maps to: txn_count
+        'total_revenue',             # Maps to: revenue
+        'average_transaction_value', # Maps to: avg_txn_value
+        'unique_customers',          # Maps to: unique_cust
+        'store_count'                # Maps to: store_cnt
+    ],
+    'payment_method_analysis': [
+        'transaction_count', 
+        'total_amount', 
+        'avg_amount', 
+        'total_tax'
+    ],
+    'customer_segment_analysis': [
+        'customer_count', 
+        'total_revenue', 
+        'avg_order_value', 
+        'total_items_purchased', 
+        'total_orders'
+    ],
+    'store_performance_ranking': [
+        'transaction_count', 
+        'total_revenue', 
+        'revenue_rank', 
+        'overall_rank'
+    ],
+    'transaction_details_enriched': [
+        'amount', 
+        'quantity', 
+        'unit_price', 
+        'discount', 
+        'tax', 
+        'shipping_cost', 
+        'total_amount'
+    ],
+    'monthly_revenue_trends': [
+        'total_revenue', 
+        'transaction_count', 
+        'avg_transaction'
+    ],
+    'discount_impact_analysis': [
+        'transaction_count', 
+        'total_discount', 
+        'avg_discount', 
+        'revenue'
+    ],
+    'employee_sales_performance': [
+        'sales_count', 
+        'total_sales', 
+        'avg_sale', 
+        'store_rank'
+    ],
+    'status_breakdown_by_day': [
+        'transaction_count',  # Maps to: txn_count
+        'total_amount',       # Maps to: total_amt
+        'average_amount'      # Maps to: avg_amt
+    ],
+    'tax_summary_by_region': [
+        'total_tax', 
+        'taxable_amount', 
+        'avg_tax', 
+        'effective_tax_rate'
+    ],
+    'shipping_cost_analysis': [
+        'total_shipping', 
+        'avg_shipping', 
+        'shipment_count'
+    ]
+}
+
+# ============================================
+# 4. COLUMN MAPPINGS (RENAMES)
+# Used in Steps 2, 6, 7, and 8
+# Maps Redshift column names to Databricks column names
+# Add mappings as you discover renamed columns during testing
+# Format: 'redshift_column_name': 'databricks_column_name'
+# Can be empty dict {} if no mappings
+# Use None or '' for dropped/new columns
+# ============================================
+
+COLUMN_MAPPINGS = {
+    'regional_performance': {
+        'transaction_count': 'txn_count',
+        'total_revenue': 'revenue',
+        'average_transaction_value': 'avg_txn_value',
+        'unique_customers': 'unique_cust',
+        'store_count': 'store_cnt'
+    },
+    'status_breakdown_by_day': {
+        'transaction_date': 'txn_date',
+        'transaction_count': 'txn_count',
+        'total_amount': 'total_amt',
+        'average_amount': 'avg_amt'
+    },
+    'shipping_cost_analysis': {
+        'old_column': 'created_at'  # Schema difference - different columns
+    }
+    # Add more mappings as you discover them during UAT execution
+    # Example:
+    # 'view_name': {
+    #     'old_column_name': 'new_column_name',
+    #     'dropped_column': None,  # Column exists in Redshift but not in Databricks
+    #     'new_column': '',  # Column exists in Databricks but not in Redshift
+    # }
+}
+
+# ============================================
+# 5. PRIMARY KEYS (OPTIONAL - NOT REQUIRED)
+# Only specify if you know the primary keys
+# Used for advanced row-level reconciliation (not in current script)
+# Leave empty {} if unknown - script will work fine without them
+# ============================================
+
+PRIMARY_KEYS = {
+    # Uncomment and fill if you know primary keys:
+    # 'customer_orders_summary': ['customer_id'],
+    # 'daily_sales_summary': ['transaction_date', 'region'],
+    # 'transaction_details_enriched': ['transaction_id'],
+}
+
+# ============================================
+# 6. TOLERANCE THRESHOLDS
+# Define acceptable variance levels for different tests
+# ============================================
+
+TOLERANCES = {
+    # Step 7: Row Count Reconciliation
+    'row_count_warn_threshold': 0.01,   # Warn if difference > 1%
+    'row_count_fail_threshold': 0.05,   # Fail if difference > 5%
+    
+    # Step 8: Business Metrics Validation
+    'numeric_tolerance': 0.01,          # Allow 0.01 difference for floating point
+    'metric_diff_warn': 0.01,           # Warn if metric differs by > 1%
+    'metric_diff_fail': 0.05            # Fail if metric differs by > 5%
+}
+
+# ============================================
+# 7. SEQUENTIAL TEST EXECUTION INFO
+# This configuration supports the following 8-step test sequence:
+# 
+# Step 1: View Existence & Accessibility
+# Step 2: Column Names (Missing/Extra)
+# Step 3: Data Types Comparison
+# Step 4: Nullability Constraint Check (IS_NULLABLE)
+# Step 5: Nullability Analysis (NULL counts)
+# Step 6: Ordinal Position (Column Order)
+# Step 7: Row Count Reconciliation
+# Step 8: Business Metrics Validation
+#
+# All steps run automatically for each view
+# ============================================
+
+print("="*100)
+print("✅ UAT CONFIGURATION LOADED - SEQUENTIAL 8-STEP TESTING")
+print("="*100)
+print(f"\n📊 TEST SCOPE:")
+print(f"   Views to test:        {len(VIEWS_TO_TEST)}")
+print(f"   Test date range:      {START_DATE} to {END_DATE}")
+print(f"\n🔧 CONFIGURATION:")
+print(f"   Column mappings:      {len(COLUMN_MAPPINGS)} views with known renames")
+print(f"   Business metrics:     {sum(len(v) for v in BUSINESS_METRICS.values()) if BUSINESS_METRICS else 0} total metrics defined")
+print(f"   Date filters:         {sum(1 for v in DATE_COLUMNS.values() if v is not None) if DATE_COLUMNS else 0} views with date filtering")
+print(f"   Primary keys:         {len(PRIMARY_KEYS)} views defined (optional)")
+print(f"\n📍 SOURCE & TARGET:")
+print(f"   Redshift:    {REDSHIFT_CATALOG}.{REDSHIFT_SCHEMA}")
+print(f"   Databricks:  {DATABRICKS_CATALOG}.{DATABRICKS_SCHEMA}")
+print(f"\n⚙️  TOLERANCE THRESHOLDS:")
+print(f"   Row count warning:    {TOLERANCES['row_count_warn_threshold']*100}%")
+print(f"   Row count failure:    {TOLERANCES['row_count_fail_threshold']*100}%")
+print(f"   Metric warning:       {TOLERANCES['metric_diff_warn']*100}%")
+print(f"   Metric failure:       {TOLERANCES['metric_diff_fail']*100}%")
+print("="*100)
+print("\n✅ Configuration loaded successfully!")
+print("📌 Ready to execute sequential UAT testing\n")
+
+# COMMAND ----------
+
+# ============================================
+# CELL 2: MAIN UAT EXECUTION LOGIC
+# ============================================
+
+print("\n" + "="*100)
+print("STARTING SEQUENTIAL UAT EXECUTION")
+print("="*100)
+print(f"⏰ Start Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+print(f"📊 Total Views: {len(VIEWS_TO_TEST)}")
+print(f"📅 Test Period: {START_DATE} to {END_DATE}")
+print("="*100)
+
+all_test_results = {}
+execution_summary = {
+    'start_time': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+    'views_tested': 0,
+    'test_results_summary': []
+}
+
+# ============================================
+# HELPER FUNCTIONS
+# ============================================
+
+def create_status_emoji(status):
+    """Return emoji for given status"""
+    emoji_map = {
+        'PASS': '✅',
+        'WARN': '⚠️',
+        'FAIL': '❌',
+        'ERROR': '🔥',
+        'SKIPPED': '⏭️'
+    }
+    return emoji_map.get(status, '❓')
+
+def print_test_header(test_num, test_name):
+    """Print formatted test header"""
+    print("\n" + "="*100)
+    print(f"TEST {test_num}: {test_name}")
+    print("="*100)
+
+def get_mapped_column(view_name, col_name):
+    """Get mapped column name for Databricks if exists, else return original"""
+    if not col_name:
+        return col_name
+    if view_name in COLUMN_MAPPINGS and col_name in COLUMN_MAPPINGS[view_name]:
+        mapped = COLUMN_MAPPINGS[view_name][col_name]
+        if mapped is None or mapped == '':
+            return None
+        return mapped
+    return col_name
+
+def get_date_columns_list(view_name):
+    """Get list of date/timestamp columns for a view"""
+    configured_cols = DATE_COLUMNS.get(view_name)
+    
+    if configured_cols:
+        if isinstance(configured_cols, str):
+            return [configured_cols]
+        elif isinstance(configured_cols, list):
+            return configured_cols
+        else:
+            return []
+    
+    try:
+        schema = spark.sql(f"DESCRIBE {REDSHIFT_CATALOG}.{REDSHIFT_SCHEMA}.{view_name}").toPandas()
+        schema = schema[~schema['col_name'].str.startswith('#')]
+        
+        date_type_columns = []
+        for _, row in schema.iterrows():
+            col_name = row['col_name']
+            data_type = row['data_type'].lower()
+            
+            if any(dt in data_type for dt in ['date', 'timestamp']):
+                date_type_columns.append(col_name)
+        
+        return date_type_columns
+    except:
+        return []
+
+def get_primary_date_column(view_name):
+    """Get primary date column for filtering"""
+    date_cols = get_date_columns_list(view_name)
+    return date_cols[0] if date_cols else None
+
+def validate_business_metrics(view_name, common_cols):
+    """
+    Validate that configured business metrics exist in common columns.
+    Checks both original Redshift names and mapped Databricks names.
+    Returns: (valid_metrics, invalid_metrics)
+    """
+    configured_metrics = BUSINESS_METRICS.get(view_name, [])
+    
+    if not configured_metrics:
+        return [], []
+    
+    valid_metrics = []
+    invalid_metrics = []
+    
+    for metric in configured_metrics:
+        # Check if original Redshift column name exists in common_cols
+        # OR if its mapped Databricks name exists in common_cols
+        mapped_metric = get_mapped_column(view_name, metric)
+        
+        if metric in common_cols or (mapped_metric and mapped_metric in common_cols):
+            valid_metrics.append(metric)
+        else:
+            invalid_metrics.append(metric)
+    
+    return valid_metrics, invalid_metrics
+
+# ============================================
+# EXECUTION START
+# ============================================
+
+execution_summary = {
+    'start_time': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+    'end_time': None
+}
+
+print("\n" + "="*100)
+print("🚀 STARTING COMPREHENSIVE UAT EXECUTION")
+print("="*100)
+print(f"Execution Started: {execution_summary['start_time']}")
+print(f"Source: {REDSHIFT_CATALOG}.{REDSHIFT_SCHEMA}")
+print(f"Target: {DATABRICKS_CATALOG}.{DATABRICKS_SCHEMA}")
+print(f"Views to Test: {len(VIEWS_TO_TEST)}")
+print(f"Date Range: {START_DATE} to {END_DATE}")
+
+yesterday = datetime.now() - timedelta(days=1)
+one_month_ago = yesterday - timedelta(days=30)
+six_months_ago = yesterday - timedelta(days=180)
+one_year_ago = yesterday - timedelta(days=365)
+three_year_ago = yesterday - timedelta(days=1095)
+
+print(f"\n📅 Time Period Calculations:")
+print(f"   Yesterday: {yesterday.strftime('%Y-%m-%d')}")
+print(f"   1 Month Ago: {one_month_ago.strftime('%Y-%m-%d')}")
+print(f"   6 Months Ago: {six_months_ago.strftime('%Y-%m-%d')}")
+print(f"   1 Year Ago: {one_year_ago.strftime('%Y-%m-%d')}")
+print(f"   3 Year Ago: {three_year_ago.strftime('%Y-%m-%d')}")
+
+all_test_results = {}
+test_keys = [
+    'test_1_existence',
+    'test_2_column_names',
+    'test_3_data_types',
+    'test_4_nullability_constraint',
+    'test_5_nullability_analysis',
+    'test_6_ordinal_position',
+    'test_7_row_count',
+    'test_8_business_metrics'
+]
+
+for view_idx, view_name in enumerate(VIEWS_TO_TEST, 1):
+    print("\n\n" + "█"*100)
+    print(f"VIEW {view_idx}/{len(VIEWS_TO_TEST)}: {view_name}")
+    print("█"*100)
+    
+    rs_path = f"{REDSHIFT_CATALOG}.{REDSHIFT_SCHEMA}.{view_name}"
+    db_path = f"{DATABRICKS_CATALOG}.{DATABRICKS_SCHEMA}.{view_name}"
+    
+    view_results = {
+        'view_name': view_name,
+        'overall_status': 'PASS'
+    }
+    
+    # ============================================
+    # STEP 1: VIEW EXISTENCE
+    # ============================================
+    
+    print_test_header(1, "VIEW EXISTENCE CHECK")
+    
+    test_1 = {
+        'test_name': 'View Existence',
+        'test_number': 1,
+        'status': 'PASS'
+    }
+    
+    print(f"\n🔍 Checking Redshift view: {rs_path}...")
+    try:
+        rs_exists = spark.sql(f"SELECT COUNT(*) as cnt FROM {rs_path} LIMIT 1").collect()[0]['cnt'] >= 0
+        test_1['redshift_exists'] = True
+        print(f"   ✅ Redshift view is accessible")
+    except Exception as e:
+        rs_exists = False
+        test_1['redshift_exists'] = False
+        test_1['status'] = 'FAIL'
+        print(f"   ❌ Redshift view NOT FOUND or inaccessible")
+        print(f"   Error: {str(e)[:200]}")
+    
+    print(f"\n🔍 Checking Databricks view: {db_path}...")
+    try:
+        db_exists = spark.sql(f"SELECT COUNT(*) as cnt FROM {db_path} LIMIT 1").collect()[0]['cnt'] >= 0
+        test_1['databricks_exists'] = True
+        print(f"   ✅ Databricks view is accessible")
+    except Exception as e:
+        db_exists = False
+        test_1['databricks_exists'] = False
+        test_1['status'] = 'FAIL'
+        print(f"   ❌ Databricks view NOT FOUND or inaccessible")
+        print(f"   Error: {str(e)[:200]}")
+    
+    if not rs_exists or not db_exists:
+        print(f"\n❌ TEST 1 FAILED: Cannot proceed with remaining tests")
+        test_1['can_proceed'] = False
+        view_results['test_1_existence'] = test_1
+        view_results['overall_status'] = 'FAIL'
+        
+        for i in range(2, 9):
+            test_key = test_keys[i-1]
+            view_results[test_key] = {
+                'test_name': ['Column Names', 'Data Types', 'Nullability Constraint', 'Nullability Analysis',
+                             'Ordinal Position', 'Row Count', 'Business Metrics'][i-2],
+                'test_number': i,
+                'status': 'SKIPPED',
+                'reason': 'View existence check failed'
+            }
+        
+        all_test_results[view_name] = view_results
+        continue
+    
+    test_1['can_proceed'] = True
+    print(f"\n{create_status_emoji(test_1['status'])} TEST 1 STATUS: {test_1['status']}")
+    
+    view_results['test_1_existence'] = test_1
+    
+    # ============================================
+    # STEP 2: COLUMN NAMES COMPARISON
+    # ============================================
+    
+    print_test_header(2, "COLUMN NAMES COMPARISON")
+    
+    test_2 = {
+        'test_name': 'Column Names',
+        'test_number': 2,
+        'status': 'PASS'
+    }
+    
+    rs_schema = spark.sql(f"DESCRIBE {rs_path}").toPandas()
+    db_schema = spark.sql(f"DESCRIBE {db_path}").toPandas()
+    
+    rs_schema = rs_schema[~rs_schema['col_name'].str.startswith('#')]
+    db_schema = db_schema[~db_schema['col_name'].str.startswith('#')]
+    
+    rs_schema['position'] = range(1, len(rs_schema) + 1)
+    db_schema['position'] = range(1, len(db_schema) + 1)
+    
+    rs_cols = set(rs_schema['col_name'].tolist())
+    db_cols = set(db_schema['col_name'].tolist())
+    
+    mapped_rs_cols = set()
+    for col in rs_cols:
+        mapped_col = get_mapped_column(view_name, col)
+        if mapped_col:
+            mapped_rs_cols.add(mapped_col)
+    
+    common_cols = mapped_rs_cols.intersection(db_cols)
+    rs_only = rs_cols - db_cols
+    db_only = db_cols - mapped_rs_cols
+    
+    test_2['redshift_columns'] = len(rs_cols)
+    test_2['databricks_columns'] = len(db_cols)
+    test_2['common_columns'] = len(common_cols)
+    test_2['redshift_only'] = list(rs_only)
+    test_2['databricks_only'] = list(db_only)
+    test_2['rs_schema'] = rs_schema.to_dict('records')
+    test_2['db_schema'] = db_schema.to_dict('records')
+    
+    column_summary = [{
+        'Category': 'Redshift Columns',
+        'Count': len(rs_cols),
+        'Details': ', '.join(sorted(rs_cols)[:10]) + ('...' if len(rs_cols) > 10 else '')
+    }, {
+        'Category': 'Databricks Columns',
+        'Count': len(db_cols),
+        'Details': ', '.join(sorted(db_cols)[:10]) + ('...' if len(db_cols) > 10 else '')
+    }, {
+        'Category': 'Common Columns',
+        'Count': len(common_cols),
+        'Details': ', '.join(sorted(common_cols)[:10]) + ('...' if len(common_cols) > 10 else '')
+    }, {
+        'Category': 'Redshift Only',
+        'Count': len(rs_only),
+        'Details': ', '.join(sorted(rs_only)) if rs_only else 'None'
+    }, {
+        'Category': 'Databricks Only',
+        'Count': len(db_only),
+        'Details': ', '.join(sorted(db_only)) if db_only else 'None'
+    }]
+    
+    print(f"\n📊 COLUMN COMPARISON SUMMARY:")
+    display(pd.DataFrame(column_summary))
+    
+    if rs_only:
+        test_2['status'] = 'WARN'
+        print(f"\n⚠️ {len(rs_only)} columns exist ONLY in Redshift: {sorted(rs_only)}")
+    
+    if db_only:
+        test_2['status'] = 'WARN'
+        print(f"\n⚠️ {len(db_only)} columns exist ONLY in Databricks: {sorted(db_only)}")
+    
+    if not common_cols:
+        test_2['status'] = 'FAIL'
+        print(f"\n❌ CRITICAL: No common columns found!")
+    else:
+        print(f"\n✅ {len(common_cols)} common columns identified for further testing")
+    
+    print(f"\n{create_status_emoji(test_2['status'])} TEST 2 STATUS: {test_2['status']}")
+    
+    view_results['test_2_column_names'] = test_2
+    
+    if test_2['status'] == 'FAIL':
+        view_results['overall_status'] = 'FAIL'
+    elif test_2['status'] == 'WARN' and view_results['overall_status'] == 'PASS':
+        view_results['overall_status'] = 'WARN'
+    
+    if not common_cols:
+        for i in range(3, 9):
+            test_key = test_keys[i-1]
+            view_results[test_key] = {
+                'test_name': ['Data Types', 'Nullability Constraint', 'Nullability Analysis', 
+                             'Ordinal Position', 'Row Count', 'Business Metrics'][i-3],
+                'test_number': i,
+                'status': 'SKIPPED',
+                'reason': 'No common columns found'
+            }
+        all_test_results[view_name] = view_results
+        continue
+    
+    # ============================================
+    # STEP 3: DATA TYPES COMPARISON (FULL OUTER JOIN)
+    # ✨ NOW WITH DDL TYPE VALIDATION
+    # ============================================
+    
+    print_test_header(3, "DATA TYPES COMPARISON WITH DDL VALIDATION")
+    
+    test_3 = {
+        'test_name': 'Data Types',
+        'test_number': 3,
+        'status': 'PASS'
+    }
+    
+    type_comparison = []
+    type_mismatches = []
+    type_warnings = []  # For equivalent types that should be reviewed
+    
+    # FULL OUTER JOIN: Check all columns from both systems
+    all_cols_for_comparison = set()
+    
+    # Add all Redshift columns (mapped to Databricks names)
+    for rs_col in rs_cols:
+        mapped = get_mapped_column(view_name, rs_col)
+        if mapped:
+            all_cols_for_comparison.add((rs_col, mapped))
+        else:
+            all_cols_for_comparison.add((rs_col, rs_col))
+    
+    # Add Databricks-only columns
+    for db_col in db_cols:
+        is_mapped = False
+        for rs_col in rs_cols:
+            if get_mapped_column(view_name, rs_col) == db_col:
+                is_mapped = True
+                break
+        if not is_mapped:
+            all_cols_for_comparison.add((None, db_col))
+    
+    # Compare data types for all columns WITH DDL VALIDATION
+    for rs_col, db_col in sorted(all_cols_for_comparison):
+        if rs_col and rs_col in rs_cols:
+            rs_type = rs_schema[rs_schema['col_name'] == rs_col]['data_type'].iloc[0]
+        else:
+            rs_type = 'NOT IN REDSHIFT'
+        
+        if db_col and db_col in db_cols:
+            db_type = db_schema[db_schema['col_name'] == db_col]['data_type'].iloc[0]
+        else:
+            db_type = 'NOT IN DATABRICKS'
+        
+        # ⭐ USE DDL VALIDATION LOGIC
+        validation_result = validate_type_compatibility(rs_type, db_type)
+        
+        display_name = db_col if db_col else rs_col
+        
+        # Build comparison record with validation details
+        type_comparison.append({
+            'Column Name': display_name,
+            'Redshift Column': rs_col if rs_col else 'N/A',
+            'Redshift Type': rs_type,
+            'Databricks Column': db_col if db_col else 'N/A',
+            'Databricks Type': db_type,
+            'Compatibility': validation_result['display_status'],
+            'Match Type': validation_result['match_type'],
+            'Explanation': validation_result['explanation'],
+            'Status Icon': validation_result['status']
+        })
+        
+        # Categorize issues
+        if not validation_result['compatible']:
+            if validation_result['match_type'] == 'missing':
+                # Missing columns - this is a WARN
+                if test_3['status'] == 'PASS':
+                    test_3['status'] = 'WARN'
+                type_mismatches.append({
+                    'column': display_name,
+                    'redshift_column': rs_col,
+                    'redshift_type': rs_type,
+                    'databricks_column': db_col,
+                    'databricks_type': db_type,
+                    'issue': 'Column missing in one system',
+                    'severity': 'MEDIUM'
+                })
+            else:
+                # Type mismatch - this is a FAIL
+                test_3['status'] = 'FAIL'
+                type_mismatches.append({
+                    'column': display_name,
+                    'redshift_column': rs_col,
+                    'redshift_type': rs_type,
+                    'databricks_column': db_col,
+                    'databricks_type': db_type,
+                    'issue': validation_result['explanation'],
+                    'severity': 'HIGH'
+                })
+        elif validation_result['match_type'] == 'equivalent':
+            # Valid conversion but worth noting
+            type_warnings.append({
+                'column': display_name,
+                'redshift_type': rs_type,
+                'databricks_type': db_type,
+                'note': validation_result['explanation']
+            })
+    
+    test_3['types_checked'] = len(all_cols_for_comparison)
+    test_3['type_mismatches'] = type_mismatches
+    test_3['type_warnings'] = type_warnings
+    test_3['mismatch_count'] = len(type_mismatches)
+    test_3['warning_count'] = len(type_warnings)
+    test_3['type_comparison'] = type_comparison
+    
+    print(f"\n📊 Checking data types for {len(all_cols_for_comparison)} columns with DDL validation...")
+    
+    print(f"\n📊 DATA TYPE COMPARISON WITH VALIDATION:")
+    display(pd.DataFrame(type_comparison))
+    
+    # Summary statistics
+    exact_matches = len([t for t in type_comparison if t['Match Type'] == 'exact'])
+    equivalent_matches = len([t for t in type_comparison if t['Match Type'] == 'equivalent'])
+    mismatches = len([t for t in type_comparison if t['Match Type'] == 'mismatch'])
+    missing = len([t for t in type_comparison if t['Match Type'] == 'missing'])
+    
+    print(f"\n📈 TYPE VALIDATION SUMMARY:")
+    print(f"   ✅ Exact Matches: {exact_matches}")
+    print(f"   ✅ Equivalent Types (Valid Conversions): {equivalent_matches}")
+    print(f"   ❌ Type Mismatches: {mismatches}")
+    print(f"   ❌ Missing Columns: {missing}")
+    
+    if type_warnings:
+        print(f"\n⚠️  VALID TYPE CONVERSIONS DETECTED ({len(type_warnings)} columns):")
+        print(f"   These are valid migrations but worth reviewing:")
+        for tw in type_warnings[:10]:
+            print(f"   • {tw['column']}: {tw['redshift_type']} → {tw['databricks_type']}")
+            print(f"     {tw['note']}")
+    
+    if type_mismatches:
+        print(f"\n❌ TYPE ISSUES FOUND ({len(type_mismatches)} columns):")
+        for tm in type_mismatches[:10]:
+            print(f"   • {tm['column']}: RS={tm['redshift_type']}, DB={tm['databricks_type']}")
+            print(f"     Issue: {tm['issue']} (Severity: {tm['severity']})")
+    else:
+        print(f"\n✅ All data types are compatible!")
+    
+    print(f"\n{create_status_emoji(test_3['status'])} TEST 3 STATUS: {test_3['status']}")
+    
+    view_results['test_3_data_types'] = test_3
+    
+    if test_3['status'] == 'FAIL':
+        view_results['overall_status'] = 'FAIL'
+    elif test_3['status'] == 'WARN' and view_results['overall_status'] == 'PASS':
+        view_results['overall_status'] = 'WARN'
+    
+    # ============================================
+    # STEP 4: NULLABILITY CONSTRAINT CHECK (FULL OUTER JOIN)
+    # ============================================
+    
+    print_test_header(4, "NULLABILITY CONSTRAINT CHECK (IS_NULLABLE)")
+    
+    test_4 = {
+        'test_name': 'Nullability Constraint',
+        'test_number': 4,
+        'status': 'PASS'
+    }
+    
+    print(f"\n📊 Checking IS_NULLABLE constraint...")
+    
+    try:
+        rs_nullable_query = f"""
+            SELECT column_name, is_nullable
+            FROM information_schema.columns
+            WHERE table_schema = '{REDSHIFT_SCHEMA}'
+            AND table_name = '{view_name}'
+        """
+        rs_nullable_df = spark.sql(rs_nullable_query).toPandas()
+        rs_nullable_dict = dict(zip(rs_nullable_df['column_name'], rs_nullable_df['is_nullable']))
+        
+        db_nullable_query = f"""
+            SELECT column_name, is_nullable
+            FROM {DATABRICKS_CATALOG}.information_schema.columns
+            WHERE table_schema = '{DATABRICKS_SCHEMA}'
+            AND table_name = '{view_name}'
+        """
+        db_nullable_df = spark.sql(db_nullable_query).toPandas()
+        db_nullable_dict = dict(zip(db_nullable_df['column_name'], db_nullable_df['is_nullable']))
+        
+        nullable_comparison = []
+        nullable_mismatches = []
+        
+        # FULL OUTER JOIN: Check all columns from both systems
+        all_cols_for_comparison = set()
+        
+        for rs_col in rs_cols:
+            mapped = get_mapped_column(view_name, rs_col)
+            if mapped:
+                all_cols_for_comparison.add((rs_col, mapped))
+            else:
+                all_cols_for_comparison.add((rs_col, rs_col))
+        
+        for db_col in db_cols:
+            is_mapped = False
+            for rs_col in rs_cols:
+                if get_mapped_column(view_name, rs_col) == db_col:
+                    is_mapped = True
+                    break
+            if not is_mapped:
+                all_cols_for_comparison.add((None, db_col))
+        
+        for rs_col, db_col in sorted(all_cols_for_comparison):
+            if rs_col and rs_col in rs_nullable_dict:
+                rs_nullable = rs_nullable_dict[rs_col]
+            elif rs_col:
+                rs_nullable = 'NOT IN REDSHIFT SCHEMA'
+            else:
+                rs_nullable = 'NOT IN REDSHIFT'
+            
+            if db_col and db_col in db_nullable_dict:
+                db_nullable = db_nullable_dict[db_col]
+            elif db_col:
+                db_nullable = 'NOT IN DATABRICKS SCHEMA'
+            else:
+                db_nullable = 'NOT IN DATABRICKS'
+            
+            # Determine match
+            if 'NOT IN' in rs_nullable or 'NOT IN' in db_nullable:
+                match = False
+                match_status = '❌ MISSING'
+            else:
+                match = rs_nullable == db_nullable
+                match_status = '✅ YES' if match else '❌ NO'
+            
+            display_name = db_col if db_col else rs_col
+            
+            nullable_comparison.append({
+                'Column Name': display_name,
+                'Redshift Column': rs_col if rs_col else 'N/A',
+                'Redshift IS_NULLABLE': rs_nullable,
+                'Databricks Column': db_col if db_col else 'N/A',
+                'Databricks IS_NULLABLE': db_nullable,
+                'Match': match_status
+            })
+            
+            if not match:
+                nullable_mismatches.append({
+                    'column': display_name,
+                    'redshift_column': rs_col,
+                    'redshift_nullable': rs_nullable,
+                    'databricks_column': db_col,
+                    'databricks_nullable': db_nullable
+                })
+        
+        test_4['columns_checked'] = len(all_cols_for_comparison)
+        test_4['nullable_comparison'] = nullable_comparison
+        test_4['mismatch_count'] = len(nullable_mismatches)
+        test_4['mismatches'] = nullable_mismatches
+        
+        print(f"\n📊 NULLABILITY CONSTRAINT COMPARISON:")
+        display(pd.DataFrame(nullable_comparison))
+        
+        if nullable_mismatches:
+            test_4['status'] = 'WARN'
+            print(f"\n⚠️ NULLABILITY CONSTRAINT MISMATCHES FOUND ({len(nullable_mismatches)} columns):")
+            for nm in nullable_mismatches[:10]:
+                print(f"   {nm['column']}: RS={nm['redshift_nullable']}, DB={nm['databricks_nullable']}")
+        else:
+            print(f"\n✅ All nullability constraints match!")
+        
+    except Exception as e:
+        test_4['status'] = 'ERROR'
+        test_4['error'] = str(e)
+        test_4['columns_checked'] = 0
+        print(f"\n❌ ERROR checking nullability constraints: {str(e)[:200]}")
+        print(f"   Note: IS_NULLABLE check requires access to INFORMATION_SCHEMA")
+    
+    print(f"\n{create_status_emoji(test_4['status'])} TEST 4 STATUS: {test_4['status']}")
+    
+    view_results['test_4_nullability_constraint'] = test_4
+    
+    if test_4['status'] == 'WARN' and view_results['overall_status'] == 'PASS':
+        view_results['overall_status'] = 'WARN'
+    
+    # ============================================
+    # STEP 5: NULLABILITY ANALYSIS (FULL OUTER JOIN)
+    # ============================================
+    
+    print_test_header(5, "NULLABILITY ANALYSIS (NULL COUNTS)")
+    
+    test_5 = {
+        'test_name': 'Nullability Analysis',
+        'test_number': 5,
+        'status': 'PASS'
+    }
+    
+    print(f"\n📊 Checking NULL counts...")
+    
+    nullability_data = []
+    
+    rs_df = spark.table(rs_path)
+    db_df = spark.table(db_path)
+    
+    # FULL OUTER JOIN: Check all columns (limit to first 20 from each side)
+    all_cols_for_analysis = set()
+    
+    # Add up to 20 Redshift columns
+    for idx, rs_col in enumerate(sorted(rs_cols)):
+        if idx >= 20:
+            break
+        mapped = get_mapped_column(view_name, rs_col)
+        if mapped:
+            all_cols_for_analysis.add((rs_col, mapped))
+        else:
+            all_cols_for_analysis.add((rs_col, rs_col))
+    
+    # Add up to 20 Databricks-only columns
+    db_only_count = 0
+    for db_col in sorted(db_cols):
+        if db_only_count >= 20:
+            break
+        is_mapped = False
+        for rs_col in rs_cols:
+            if get_mapped_column(view_name, rs_col) == db_col:
+                is_mapped = True
+                break
+        if not is_mapped:
+            all_cols_for_analysis.add((None, db_col))
+            db_only_count += 1
+    
+    for rs_col, db_col in sorted(all_cols_for_analysis):
+        display_name = db_col if db_col else rs_col
+        
+        try:
+            if rs_col and rs_col in rs_cols:
+                rs_nulls = rs_df.filter(F.col(rs_col).isNull()).count()
+            else:
+                rs_nulls = 'N/A'
+            
+            if db_col and db_col in db_cols:
+                db_nulls = db_df.filter(F.col(db_col).isNull()).count()
+            else:
+                db_nulls = 'N/A'
+            
+            if rs_nulls == 'N/A' or db_nulls == 'N/A':
+                diff = 'N/A'
+                status = '❌ MISSING'
+                if test_5['status'] == 'PASS':
+                    test_5['status'] = 'WARN'
+            else:
+                diff = db_nulls - rs_nulls
+                
+                if diff == 0:
+                    status = '✅ Match'
+                elif abs(diff) < 10:
+                    status = '⚠️ Minor Diff'
+                    if test_5['status'] == 'PASS':
+                        test_5['status'] = 'WARN'
+                else:
+                    status = '❌ Significant'
+                    test_5['status'] = 'FAIL'
+            
+            nullability_data.append({
+                'Column': display_name,
+                'Redshift Column': rs_col if rs_col else 'N/A',
+                'Redshift NULLs': rs_nulls,
+                'Databricks Column': db_col if db_col else 'N/A',
+                'Databricks NULLs': db_nulls,
+                'Difference': diff,
+                'Status': status
+            })
+        except Exception as col_error:
+            nullability_data.append({
+                'Column': display_name,
+                'Redshift Column': rs_col if rs_col else 'N/A',
+                'Redshift NULLs': 'ERROR',
+                'Databricks Column': db_col if db_col else 'N/A',
+                'Databricks NULLs': 'ERROR',
+                'Difference': 'ERROR',
+                'Status': '❌ ERROR'
+            })
+    
+    test_5['columns_checked'] = len(nullability_data)
+    test_5['nullability_comparison'] = nullability_data
+    
+    print(f"\n📊 NULLABILITY ANALYSIS:")
+    display(pd.DataFrame(nullability_data))
+    
+    diffs = [n for n in nullability_data if n['Difference'] != 0 and n['Difference'] != 'ERROR' and n['Difference'] != 'N/A']
+    if diffs:
+        print(f"\n⚠️ {len(diffs)} columns have NULL count differences")
+    else:
+        print(f"\n✅ All checked columns have matching NULL counts!")
+    
+    print(f"\n{create_status_emoji(test_5['status'])} TEST 5 STATUS: {test_5['status']}")
+    
+    view_results['test_5_nullability_analysis'] = test_5
+    
+    if test_5['status'] == 'FAIL':
+        view_results['overall_status'] = 'FAIL'
+    elif test_5['status'] == 'WARN' and view_results['overall_status'] == 'PASS':
+        view_results['overall_status'] = 'WARN'
+    
+    # ============================================
+    # STEP 6: ORDINAL POSITION (FULL OUTER JOIN)
+    # ============================================
+    
+    print_test_header(6, "ORDINAL POSITION (COLUMN ORDER)")
+    
+    test_6 = {
+        'test_name': 'Ordinal Position',
+        'test_number': 6,
+        'status': 'PASS'
+    }
+    
+    position_comparison = []
+    position_mismatches = []
+    
+    # FULL OUTER JOIN: Check all columns
+    all_cols_for_comparison = set()
+    
+    for rs_col in rs_cols:
+        mapped = get_mapped_column(view_name, rs_col)
+        if mapped:
+            all_cols_for_comparison.add((rs_col, mapped))
+        else:
+            all_cols_for_comparison.add((rs_col, rs_col))
+    
+    for db_col in db_cols:
+        is_mapped = False
+        for rs_col in rs_cols:
+            if get_mapped_column(view_name, rs_col) == db_col:
+                is_mapped = True
+                break
+        if not is_mapped:
+            all_cols_for_comparison.add((None, db_col))
+    
+    for rs_col, db_col in sorted(all_cols_for_comparison):
+        if rs_col and rs_col in rs_cols:
+            rs_pos = rs_schema[rs_schema['col_name'] == rs_col]['position'].iloc[0]
+        else:
+            rs_pos = 'N/A'
+        
+        if db_col and db_col in db_cols:
+            db_pos = db_schema[db_schema['col_name'] == db_col]['position'].iloc[0]
+        else:
+            db_pos = 'N/A'
+        
+        display_name = db_col if db_col else rs_col
+        
+        if rs_pos == 'N/A' or db_pos == 'N/A':
+            pos_match = False
+            match_status = '❌ MISSING'
+            diff = 'N/A'
+        else:
+            pos_match = rs_pos == db_pos
+            match_status = '✅ YES' if pos_match else '⚠️ NO'
+            diff = abs(rs_pos - db_pos)
+        
+        position_comparison.append({
+            'Column Name': display_name,
+            'Redshift Column': rs_col if rs_col else 'N/A',
+            'Redshift Position': rs_pos,
+            'Databricks Column': db_col if db_col else 'N/A',
+            'Databricks Position': db_pos,
+            'Difference': diff,
+            'Match': match_status
+        })
+        
+        if not pos_match:
+            position_mismatches.append({
+                'column': display_name,
+                'redshift_column': rs_col,
+                'redshift_position': rs_pos,
+                'databricks_column': db_col,
+                'databricks_position': db_pos,
+                'difference': diff
+            })
+    
+    test_6['positions_checked'] = len(all_cols_for_comparison)
+    test_6['position_mismatches'] = position_mismatches
+    test_6['mismatch_count'] = len(position_mismatches)
+    test_6['position_comparison'] = position_comparison
+    
+    print(f"\n📊 Checking column order for {len(all_cols_for_comparison)} columns...")
+    
+    print(f"\n📊 ORDINAL POSITION COMPARISON:")
+    display(pd.DataFrame(position_comparison))
+    
+    if position_mismatches:
+        test_6['status'] = 'WARN'
+        print(f"\n⚠️ POSITION DIFFERENCES FOUND ({len(position_mismatches)} columns):")
+        for pm in position_mismatches[:10]:
+            print(f"   {pm['column']}: RS={pm['redshift_position']}, DB={pm['databricks_position']}")
+    else:
+        print(f"\n✅ All columns are in the same order!")
+    
+    print(f"\n{create_status_emoji(test_6['status'])} TEST 6 STATUS: {test_6['status']}")
+    
+    view_results['test_6_ordinal_position'] = test_6
+    
+    if test_6['status'] == 'WARN' and view_results['overall_status'] == 'PASS':
+        view_results['overall_status'] = 'WARN'
+    
+    # ============================================
+    # STEP 7: ROW COUNT RECONCILIATION
+    # ============================================
+    
+    print_test_header(7, "ROW COUNT RECONCILIATION (MULTI-PERIOD)")
+    
+    test_7 = {
+        'test_name': 'Row Count',
+        'test_number': 7,
+        'status': 'PASS'
+    }
+    
+    try:
+        date_col = get_primary_date_column(view_name)
+        
+        row_count_results = {
+            'main_period': {},
+            'one_month': {},
+            'six_months': {},
+            'one_year': {},
+            'three_year': {}
+        }
+        
+        print(f"\n📅 MAIN TEST PERIOD: {START_DATE} to {END_DATE}")
+        
+        if date_col:
+            db_date_col = get_mapped_column(view_name, date_col)
+            if db_date_col:
+                rs_filter_main = f"WHERE {date_col} >= '{START_DATE}' AND {date_col} <= '{END_DATE}'"
+                db_filter_main = f"WHERE {db_date_col} >= '{START_DATE}' AND {db_date_col} <= '{END_DATE}'"
+                print(f"   Column: {date_col}")
+            else:
+                rs_filter_main = ""
+                db_filter_main = ""
+                print(f"   No Date Filter (column {date_col} not mapped)")
+        else:
+            rs_filter_main = ""
+            db_filter_main = ""
+            print(f"   No Date Filter (no date column configured)")
+        
+        rs_count_main = spark.sql(f"SELECT COUNT(*) as cnt FROM {rs_path} {rs_filter_main}").collect()[0]['cnt']
+        db_count_main = spark.sql(f"SELECT COUNT(*) as cnt FROM {db_path} {db_filter_main}").collect()[0]['cnt']
+        
+        difference_main = db_count_main - rs_count_main
+        diff_pct_main = (abs(difference_main) / rs_count_main * 100) if rs_count_main > 0 else 0
+        
+        row_count_results['main_period'] = {
+            'period_name': 'Main Period',
+            'period_label': f'{START_DATE} to {END_DATE}',
+            'redshift_count': rs_count_main,
+            'databricks_count': db_count_main,
+            'difference': difference_main,
+            'difference_percentage': diff_pct_main,
+            'status': 'PASS'
+        }
+        
+        if difference_main == 0:
+            print(f"   ✅ PERFECT MATCH: {rs_count_main:,} rows")
+        elif diff_pct_main < TOLERANCES['row_count_warn_threshold'] * 100:
+            print(f"   ✅ ACCEPTABLE: {diff_pct_main:.2f}% difference")
+        elif diff_pct_main < TOLERANCES['row_count_fail_threshold'] * 100:
+            row_count_results['main_period']['status'] = 'WARN'
+            test_7['status'] = 'WARN'
+            print(f"   ⚠️ WARNING: {diff_pct_main:.2f}% difference")
+        else:
+            row_count_results['main_period']['status'] = 'FAIL'
+            test_7['status'] = 'FAIL'
+            print(f"   ❌ FAIL: {diff_pct_main:.2f}% difference")
+        
+        if date_col and db_date_col:
+            # 1-Month
+            print(f"\n📅 1-MONTH PERIOD: {one_month_ago.strftime('%Y-%m-%d')} to {yesterday.strftime('%Y-%m-%d')}")
+            rs_filter_1m = f"WHERE {date_col} >= '{one_month_ago.strftime('%Y-%m-%d')}' AND {date_col} <= '{yesterday.strftime('%Y-%m-%d')}'"
+            db_filter_1m = f"WHERE {db_date_col} >= '{one_month_ago.strftime('%Y-%m-%d')}' AND {db_date_col} <= '{yesterday.strftime('%Y-%m-%d')}'"
+            
+            rs_count_1m = spark.sql(f"SELECT COUNT(*) as cnt FROM {rs_path} {rs_filter_1m}").collect()[0]['cnt']
+            db_count_1m = spark.sql(f"SELECT COUNT(*) as cnt FROM {db_path} {db_filter_1m}").collect()[0]['cnt']
+            difference_1m = db_count_1m - rs_count_1m
+            diff_pct_1m = (abs(difference_1m) / rs_count_1m * 100) if rs_count_1m > 0 else 0
+            
+            row_count_results['one_month'] = {
+                'period_name': '1-Month',
+                'period_label': f'{one_month_ago.strftime("%Y-%m-%d")} to {yesterday.strftime("%Y-%m-%d")}',
+                'redshift_count': rs_count_1m,
+                'databricks_count': db_count_1m,
+                'difference': difference_1m,
+                'difference_percentage': diff_pct_1m,
+                'status': 'PASS' if diff_pct_1m < TOLERANCES['row_count_warn_threshold'] * 100 else 'WARN' if diff_pct_1m < TOLERANCES['row_count_fail_threshold'] * 100 else 'FAIL'
+            }
+            
+            print(f"   Difference: {difference_1m:,} ({diff_pct_1m:.2f}%)")
+            
+            # 6-Month
+            print(f"\n📅 6-MONTH PERIOD: {six_months_ago.strftime('%Y-%m-%d')} to {yesterday.strftime('%Y-%m-%d')}")
+            rs_filter_6m = f"WHERE {date_col} >= '{six_months_ago.strftime('%Y-%m-%d')}' AND {date_col} <= '{yesterday.strftime('%Y-%m-%d')}'"
+            db_filter_6m = f"WHERE {db_date_col} >= '{six_months_ago.strftime('%Y-%m-%d')}' AND {db_date_col} <= '{yesterday.strftime('%Y-%m-%d')}'"
+            
+            rs_count_6m = spark.sql(f"SELECT COUNT(*) as cnt FROM {rs_path} {rs_filter_6m}").collect()[0]['cnt']
+            db_count_6m = spark.sql(f"SELECT COUNT(*) as cnt FROM {db_path} {db_filter_6m}").collect()[0]['cnt']
+            difference_6m = db_count_6m - rs_count_6m
+            diff_pct_6m = (abs(difference_6m) / rs_count_6m * 100) if rs_count_6m > 0 else 0
+            
+            row_count_results['six_months'] = {
+                'period_name': '6-Months',
+                'period_label': f'{six_months_ago.strftime("%Y-%m-%d")} to {yesterday.strftime("%Y-%m-%d")}',
+                'redshift_count': rs_count_6m,
+                'databricks_count': db_count_6m,
+                'difference': difference_6m,
+                'difference_percentage': diff_pct_6m,
+                'status': 'PASS' if diff_pct_6m < TOLERANCES['row_count_warn_threshold'] * 100 else 'WARN' if diff_pct_6m < TOLERANCES['row_count_fail_threshold'] * 100 else 'FAIL'
+            }
+            
+            print(f"   Difference: {difference_6m:,} ({diff_pct_6m:.2f}%)")
+            
+            # 1-Year
+            print(f"\n📅 1-YEAR PERIOD: {one_year_ago.strftime('%Y-%m-%d')} to {yesterday.strftime('%Y-%m-%d')}")
+            rs_filter_1y = f"WHERE {date_col} >= '{one_year_ago.strftime('%Y-%m-%d')}' AND {date_col} <= '{yesterday.strftime('%Y-%m-%d')}'"
+            db_filter_1y = f"WHERE {db_date_col} >= '{one_year_ago.strftime('%Y-%m-%d')}' AND {db_date_col} <= '{yesterday.strftime('%Y-%m-%d')}'"
+            
+            rs_count_1y = spark.sql(f"SELECT COUNT(*) as cnt FROM {rs_path} {rs_filter_1y}").collect()[0]['cnt']
+            db_count_1y = spark.sql(f"SELECT COUNT(*) as cnt FROM {db_path} {db_filter_1y}").collect()[0]['cnt']
+            difference_1y = db_count_1y - rs_count_1y
+            diff_pct_1y = (abs(difference_1y) / rs_count_1y * 100) if rs_count_1y > 0 else 0
+            
+            row_count_results['one_year'] = {
+                'period_name': '1-Year',
+                'period_label': f'{one_year_ago.strftime("%Y-%m-%d")} to {yesterday.strftime("%Y-%m-%d")}',
+                'redshift_count': rs_count_1y,
+                'databricks_count': db_count_1y,
+                'difference': difference_1y,
+                'difference_percentage': diff_pct_1y,
+                'status': 'PASS' if diff_pct_1y < TOLERANCES['row_count_warn_threshold'] * 100 else 'WARN' if diff_pct_1y < TOLERANCES['row_count_fail_threshold'] * 100 else 'FAIL'
+            }
+            
+            print(f"   Difference: {difference_1y:,} ({diff_pct_1y:.2f}%)")
+            
+            # 3-Year
+            print(f"\n📅 3-YEAR PERIOD: {three_year_ago.strftime('%Y-%m-%d')} to {yesterday.strftime('%Y-%m-%d')}")
+            rs_filter_3y = f"WHERE {date_col} >= '{three_year_ago.strftime('%Y-%m-%d')}' AND {date_col} <= '{yesterday.strftime('%Y-%m-%d')}'"
+            db_filter_3y = f"WHERE {db_date_col} >= '{three_year_ago.strftime('%Y-%m-%d')}' AND {db_date_col} <= '{yesterday.strftime('%Y-%m-%d')}'"
+            
+            rs_count_3y = spark.sql(f"SELECT COUNT(*) as cnt FROM {rs_path} {rs_filter_3y}").collect()[0]['cnt']
+            db_count_3y = spark.sql(f"SELECT COUNT(*) as cnt FROM {db_path} {db_filter_3y}").collect()[0]['cnt']
+            difference_3y = db_count_3y - rs_count_3y
+            diff_pct_3y = (abs(difference_3y) / rs_count_3y * 100) if rs_count_3y > 0 else 0
+            
+            row_count_results['three_year'] = {
+                'period_name': '3-Years',
+                'period_label': f'{three_year_ago.strftime("%Y-%m-%d")} to {yesterday.strftime("%Y-%m-%d")}',
+                'redshift_count': rs_count_3y,
+                'databricks_count': db_count_3y,
+                'difference': difference_3y,
+                'difference_percentage': diff_pct_3y,
+                'status': 'PASS' if diff_pct_3y < TOLERANCES['row_count_warn_threshold'] * 100 else 'WARN' if diff_pct_3y < TOLERANCES['row_count_fail_threshold'] * 100 else 'FAIL'
+            }
+            
+            print(f"   Difference: {difference_3y:,} ({diff_pct_3y:.2f}%)")
+            
+            for period_data in row_count_results.values():
+                if period_data.get('status') == 'FAIL':
+                    test_7['status'] = 'FAIL'
+                    break
+                elif period_data.get('status') == 'WARN' and test_7['status'] == 'PASS':
+                    test_7['status'] = 'WARN'
+        else:
+            for period_key in ['one_month', 'six_months', 'one_year', 'three_year']:
+                row_count_results[period_key] = {
+                    'period_name': period_key.replace('_', ' ').title(),
+                    'period_label': 'N/A',
+                    'redshift_count': 0,
+                    'databricks_count': 0,
+                    'difference': 0,
+                    'difference_percentage': 0,
+                    'status': 'SKIPPED',
+                    'reason': 'No date column configured'
+                }
+        
+        print(f"\n📊 ROW COUNT SUMMARY - ALL PERIODS:")
+        summary_rows = []
+        for period_key, period_data in row_count_results.items():
+            if period_data.get('status') != 'SKIPPED':
+                summary_rows.append({
+                    'Period Name': period_data.get('period_name', 'N/A'),
+                    'Date Range': period_data.get('period_label','N/A'),
+                    'Redshift': f"{period_data.get('redshift_count',0):,}",
+                    'Databricks': f"{period_data.get('databricks_count', 0):,}",
+                    'Difference': f"{period_data.get('difference', 0):,}",
+                    'Diff %': f"{period_data.get('difference_percentage', 0):.2f}%",
+                    'Status': create_status_emoji(period_data.get('status', 'UNKNOWN'))
+                })
+        
+        if summary_rows:
+            display(pd.DataFrame(summary_rows))
+        
+        test_7['row_count_periods'] = row_count_results
+        test_7['date_filtered'] = date_col is not None
+        test_7['redshift_count'] = rs_count_main
+        test_7['databricks_count'] = db_count_main
+        test_7['difference'] = difference_main
+        test_7['difference_percentage'] = diff_pct_main
+        
+    except Exception as e:
+        test_7['status'] = 'ERROR'
+        test_7['error'] = str(e)
+        print(f"\n❌ ERROR: {str(e)[:200]}")
+    
+    print(f"\n{create_status_emoji(test_7['status'])} TEST 7 STATUS: {test_7['status']}")
+    
+    view_results['test_7_row_count'] = test_7
+    
+    if test_7['status'] == 'FAIL':
+        view_results['overall_status'] = 'FAIL'
+    elif test_7['status'] == 'WARN' and view_results['overall_status'] == 'PASS':
+        view_results['overall_status'] = 'WARN'
+    
+    # ============================================
+    # STEP 8: BUSINESS METRICS VALIDATION
+    # ============================================
+    
+    print_test_header(8, "BUSINESS METRICS VALIDATION")
+    
+    test_8 = {
+        'test_name': 'Business Metrics',
+        'test_number': 8,
+        'status': 'PASS'
+    }
+    
+    valid_metrics, invalid_metrics = validate_business_metrics(view_name, common_cols)
+    
+    if not valid_metrics and not invalid_metrics:
+        print(f"\n⏭️ SKIPPED: No business metrics defined for this view")
+        test_8['status'] = 'SKIPPED'
+        test_8['reason'] = 'No metrics configured'
+    elif not valid_metrics and invalid_metrics:
+        print(f"\n❌ FAIL: All configured metrics are invalid (not in common columns)")
+        test_8['status'] = 'FAIL'
+        test_8['configured_metrics'] = BUSINESS_METRICS.get(view_name, [])
+        test_8['invalid_metrics'] = invalid_metrics
+        print(f"   Invalid metrics: {', '.join(invalid_metrics)}")
+    else:
+        try:
+            if invalid_metrics:
+                print(f"\n⚠️ WARNING: {len(invalid_metrics)} configured metrics not found in common columns:")
+                print(f"   Invalid: {', '.join(invalid_metrics)}")
+            
+            print(f"\n📊 Testing {len(valid_metrics)} valid metrics:")
+            for m in valid_metrics:
+                print(f"   - {m}")
+            
+            date_col = get_primary_date_column(view_name)
+            if date_col:
+                db_date_col = get_mapped_column(view_name, date_col)
+                if db_date_col:
+                    rs_filter = f"WHERE {date_col} >= '{START_DATE}' AND {date_col} <= '{END_DATE}'"
+                    db_filter = f"WHERE {db_date_col} >= '{START_DATE}' AND {db_date_col} <= '{END_DATE}'"
+                else:
+                    rs_filter = ""
+                    db_filter = ""
+            else:
+                rs_filter = ""
+                db_filter = ""
+            
+            metrics_results = []
+            
+            for metric in valid_metrics:
+                db_metric = get_mapped_column(view_name, metric)
+                if not db_metric:
+                    print(f"\n   ⚠️ Skipping {metric}: No valid mapping to Databricks")
+                    continue
+                
+                print(f"\n   Testing: {metric}...")
+                
+                try:
+                    rs_sum = spark.sql(f"SELECT SUM(CAST({metric} AS DOUBLE)) as val FROM {rs_path} {rs_filter}").collect()[0]['val']
+                    db_sum = spark.sql(f"SELECT SUM(CAST({db_metric} AS DOUBLE)) as val FROM {db_path} {db_filter}").collect()[0]['val']
+                    rs_sum = float(rs_sum) if rs_sum is not None else 0
+                    db_sum = float(db_sum) if db_sum is not None else 0
+                    sum_diff = abs(rs_sum - db_sum)
+                    sum_diff_pct = (sum_diff / abs(rs_sum) * 100) if rs_sum != 0 else 0
+                    
+                    rs_avg = spark.sql(f"SELECT AVG(CAST({metric} AS DOUBLE)) as val FROM {rs_path} {rs_filter}").collect()[0]['val']
+                    db_avg = spark.sql(f"SELECT AVG(CAST({db_metric} AS DOUBLE)) as val FROM {db_path} {db_filter}").collect()[0]['val']
+                    rs_avg = float(rs_avg) if rs_avg is not None else 0
+                    db_avg = float(db_avg) if db_avg is not None else 0
+                    avg_diff = abs(rs_avg - db_avg)
+                    avg_diff_pct = (avg_diff / abs(rs_avg) * 100) if rs_avg != 0 else 0
+                    
+                    rs_min = spark.sql(f"SELECT MIN(CAST({metric} AS DOUBLE)) as val FROM {rs_path} {rs_filter}").collect()[0]['val']
+                    db_min = spark.sql(f"SELECT MIN(CAST({db_metric} AS DOUBLE)) as val FROM {db_path} {db_filter}").collect()[0]['val']
+                    rs_min = float(rs_min) if rs_min is not None else 0
+                    db_min = float(db_min) if db_min is not None else 0
+                    
+                    rs_max = spark.sql(f"SELECT MAX(CAST({metric} AS DOUBLE)) as val FROM {rs_path} {rs_filter}").collect()[0]['val']
+                    db_max = spark.sql(f"SELECT MAX(CAST({db_metric} AS DOUBLE)) as val FROM {db_path} {db_filter}").collect()[0]['val']
+                    rs_max = float(rs_max) if rs_max is not None else 0
+                    db_max = float(db_max) if db_max is not None else 0
+                    
+                    rs_distinct = spark.sql(f"SELECT COUNT(DISTINCT {metric}) as val FROM {rs_path} {rs_filter}").collect()[0]['val']
+                    db_distinct = spark.sql(f"SELECT COUNT(DISTINCT {db_metric}) as val FROM {db_path} {db_filter}").collect()[0]['val']
+                    
+                    if sum_diff_pct > TOLERANCES['metric_diff_fail'] * 100 or avg_diff_pct > TOLERANCES['metric_diff_fail'] * 100:
+                        if test_8['status'] == 'PASS':
+                            test_8['status'] = 'FAIL'
+                    elif sum_diff_pct > TOLERANCES['metric_diff_warn'] * 100 or avg_diff_pct > TOLERANCES['metric_diff_warn'] * 100:
+                        if test_8['status'] == 'PASS':
+                            test_8['status'] = 'WARN'
+                    
+                    metrics_results.append({
+                        'Metric': metric,
+                        'Aggregation': 'SUM',
+                        'Redshift': f"{rs_sum:,.2f}",
+                        'Databricks': f"{db_sum:,.2f}",
+                        'Diff': f"{sum_diff:,.2f}",
+                        'Diff %': f"{sum_diff_pct:.2f}%",
+                        'Status': '✅' if sum_diff_pct < TOLERANCES['metric_diff_warn'] * 100 else '❌'
+                    })
+                    
+                    metrics_results.append({
+                        'Metric': metric,
+                        'Aggregation': 'AVG',
+                        'Redshift': f"{rs_avg:,.2f}",
+                        'Databricks': f"{db_avg:,.2f}",
+                        'Diff': f"{avg_diff:,.2f}",
+                        'Diff %': f"{avg_diff_pct:.2f}%",
+                        'Status': '✅' if avg_diff_pct < TOLERANCES['metric_diff_warn'] * 100 else '❌'
+                    })
+                    
+                    metrics_results.append({
+                        'Metric': metric,
+                        'Aggregation': 'MIN',
+                        'Redshift': f"{rs_min:,.2f}",
+                        'Databricks': f"{db_min:,.2f}",
+                        'Diff': f"{abs(rs_min - db_min):,.2f}",
+                        'Diff %': 'N/A',
+                        'Status': '✅' if rs_min == db_min else '⚠️'
+                    })
+                    
+                    metrics_results.append({
+                        'Metric': metric,
+                        'Aggregation': 'MAX',
+                        'Redshift': f"{rs_max:,.2f}",
+                        'Databricks': f"{db_max:,.2f}",
+                        'Diff': f"{abs(rs_max - db_max):,.2f}",
+                        'Diff %': 'N/A',
+                        'Status': '✅' if rs_max == db_max else '⚠️'
+                    })
+                    
+                    metrics_results.append({
+                        'Metric': metric,
+                        'Aggregation': 'COUNT DISTINCT',
+                        'Redshift': f"{rs_distinct:,}",
+                        'Databricks': f"{db_distinct:,}",
+                        'Diff': f"{abs(rs_distinct - db_distinct):,}",
+                        'Diff %': 'N/A',
+                        'Status': '✅' if rs_distinct == db_distinct else '⚠️'
+                    })
+                    
+                except Exception as metric_error:
+                    print(f"      ❌ Error processing metric: {str(metric_error)[:100]}")
+                    metrics_results.append({
+                        'Metric': metric,
+                        'Aggregation': 'ERROR',
+                        'Redshift': 'ERROR',
+                        'Databricks': 'ERROR',
+                        'Diff': 'ERROR',
+                        'Diff %': 'ERROR',
+                        'Status': '❌'
+                    })
+            
+            print(f"\n📊 BUSINESS METRICS COMPARISON:")
+            display(pd.DataFrame(metrics_results))
+            
+            test_8['metrics_tested'] = len(valid_metrics) * 5
+            test_8['metrics_results'] = metrics_results
+            test_8['valid_metrics'] = valid_metrics
+            test_8['invalid_metrics'] = invalid_metrics
+            
+            passed = len([m for m in metrics_results if m['Status'] == '✅'])
+            print(f"\n📈 SUMMARY: {passed}/{len(metrics_results)} metric checks passed")
+            
+        except Exception as e:
+            test_8['status'] = 'ERROR'
+            test_8['error'] = str(e)
+            print(f"\n❌ ERROR: {str(e)[:200]}")
+    
+    print(f"\n{create_status_emoji(test_8['status'])} TEST 8 STATUS: {test_8['status']}")
+    
+    view_results['test_8_business_metrics'] = test_8
+    
+    if test_8['status'] == 'FAIL':
+        view_results['overall_status'] = 'FAIL'
+    elif test_8['status'] == 'WARN' and view_results['overall_status'] == 'PASS':
+        view_results['overall_status'] = 'WARN'
+    
+    all_test_results[view_name] = view_results
+    
+    print(f"\n{'='*100}")
+    print(f"VIEW {view_idx} COMPLETE: {view_name}")
+    print(f"OVERALL STATUS: {create_status_emoji(view_results['overall_status'])} {view_results['overall_status']}")
+    print(f"{'='*100}")
+
+execution_summary['end_time'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+print("\n\n" + "█"*100)
+print("✅ ALL TESTS COMPLETED!")
+print("█"*100)
+print(f"Total Views Tested: {len(all_test_results)}")
+print(f"End Time: {execution_summary['end_time']}")
+
+# COMMAND ----------
+
+# ============================================
+# CELL 3: COMPREHENSIVE EXCEL REPORT GENERATION
+# ============================================
+
+# ============================================
+# HELPER FUNCTION
+# ============================================
+
+def create_status_emoji(status):
+    """Return emoji for given status"""
+    emoji_map = {
+        'PASS': '✅',
+        'WARN': '⚠️',
+        'FAIL': '❌',
+        'ERROR': '🔥',
+        'SKIPPED': '⏭️'
+    }
+    return emoji_map.get(status, '❓')
+
+# ============================================
+# EXECUTIVE SUMMARY & COMPREHENSIVE REPORTING
+# ============================================
+
+print("\n" + "="*100)
+print("EXECUTIVE SUMMARY - COMPLETE UAT RESULTS")
+print("="*100)
+
+# Define test keys and names (UPDATED FOR 8 TESTS)
+test_keys = [
+    'test_1_existence',
+    'test_2_column_names',
+    'test_3_data_types',
+    'test_4_nullability_constraint',
+    'test_5_nullability_analysis',
+    'test_6_ordinal_position',
+    'test_7_row_count',
+    'test_8_business_metrics'
+]
+
+test_names = [
+    'View Existence', 
+    'Column Names', 
+    'Data Types', 
+    'Nullability Constraint',
+    'Nullability Analysis',
+    'Ordinal Position', 
+    'Row Count', 
+    'Business Metrics'
+]
+
+# ============================================
+# 1. EXECUTION METADATA
+# ============================================
+
+print(f"\n📋 TEST EXECUTION DETAILS")
+print("-"*100)
+print(f"Start Time:        {execution_summary['start_time']}")
+print(f"End Time:          {execution_summary['end_time']}")
+print(f"Total Duration:    {str(datetime.strptime(execution_summary['end_time'], '%Y-%m-%d %H:%M:%S') - datetime.strptime(execution_summary['start_time'], '%Y-%m-%d %H:%M:%S'))}")
+print(f"\nSource System:     {REDSHIFT_CATALOG}.{REDSHIFT_SCHEMA}")
+print(f"Target System:     {DATABRICKS_CATALOG}.{DATABRICKS_SCHEMA}")
+print(f"Test Date Range:   {START_DATE} to {END_DATE}")
+
+# ============================================
+# 2. OVERALL TEST STATISTICS
+# ============================================
+
+total_views = len(all_test_results)
+views_passed = len([v for v in all_test_results.values() if v['overall_status'] == 'PASS'])
+views_warned = len([v for v in all_test_results.values() if v['overall_status'] == 'WARN'])
+views_failed = len([v for v in all_test_results.values() if v['overall_status'] == 'FAIL'])
+
+print(f"\n📊 OVERALL RESULTS")
+print("-"*100)
+print(f"Total Views Tested:    {total_views}")
+print(f"✅ Passed:             {views_passed} ({views_passed/total_views*100:.1f}%)")
+print(f"⚠️  Warnings:           {views_warned} ({views_warned/total_views*100:.1f}%)")
+print(f"❌ Failed:             {views_failed} ({views_failed/total_views*100:.1f}%)")
+
+# ============================================
+# 3. TEST-BY-TEST BREAKDOWN
+# ============================================
+
+print(f"\n📈 TEST-BY-TEST BREAKDOWN")
+print("-"*100)
+
+test_breakdown_data = []
+
+for test_idx, (test_key, test_name) in enumerate(zip(test_keys, test_names), 1):
+    passed = 0
+    warned = 0
+    failed = 0
+    error = 0
+    skipped = 0
+    
+    for view_data in all_test_results.values():
+        status = view_data[test_key]['status']
+        if status == 'PASS':
+            passed += 1
+        elif status == 'WARN':
+            warned += 1
+        elif status == 'FAIL':
+            failed += 1
+        elif status == 'ERROR':
+            error += 1
+        elif status == 'SKIPPED':
+            skipped += 1
+    
+    total_tests = passed + warned + failed + error + skipped
+    
+    test_breakdown_data.append({
+        'Test_Number': test_idx,
+        'Test_Name': test_name,
+        'Total': total_tests,
+        'Passed': passed,
+        'Passed_Pct': f"{passed/total_tests*100:.1f}%",
+        'Warned': warned,
+        'Warned_Pct': f"{warned/total_tests*100:.1f}%",
+        'Failed': failed,
+        'Failed_Pct': f"{failed/total_tests*100:.1f}%",
+        'Errors': error,
+        'Error_Pct': f"{error/total_tests*100:.1f}%",
+        'Skipped': skipped,
+        'Skipped_Pct': f"{skipped/total_tests*100:.1f}%"
+    })
+    
+    print(f"\nTest {test_idx}: {test_name}")
+    print(f"   ✅ Passed: {passed}/{total_tests} ({passed/total_tests*100:.1f}%)")
+    if warned > 0:
+        print(f"   ⚠️  Warned: {warned}/{total_tests} ({warned/total_tests*100:.1f}%)")
+    if failed > 0:
+        print(f"   ❌ Failed: {failed}/{total_tests} ({failed/total_tests*100:.1f}%)")
+    if error > 0:
+        print(f"   🔥 Errors: {error}/{total_tests} ({error/total_tests*100:.1f}%)")
+    if skipped > 0:
+        print(f"   ⏭️  Skipped: {skipped}/{total_tests} ({skipped/total_tests*100:.1f}%)")
+
+# ============================================
+# 4. COMPLETE TEST MATRIX
+# ============================================
+
+print("\n\n" + "="*100)
+print("COMPLETE TEST MATRIX - ALL VIEWS & ALL TESTS")
+print("="*100)
+
+matrix_data = []
+
+for view_name, view_data in all_test_results.items():
+    row = {
+        'View Name': view_name,
+        'Overall': f"{create_status_emoji(view_data['overall_status'])} {view_data['overall_status']}"
+    }
+    
+    for i in range(1, 9):
+        test_key = test_keys[i-1]
+        test_data = view_data[test_key]
+        row[f'T{i}'] = create_status_emoji(test_data['status'])
+    
+    matrix_data.append(row)
+
+matrix_df = pd.DataFrame(matrix_data)
+
+print("\n📊 TEST MATRIX (T1=Existence, T2=Columns, T3=Types, T4=Nullable Constraint, T5=Nullable Analysis, T6=Position, T7=RowCount, T8=Metrics):")
+display(matrix_df)
+
+# ============================================
+# 5. DETAILED VIEW-BY-VIEW SUMMARY
+# ============================================
+
+print("\n\n" + "="*100)
+print("DETAILED VIEW-BY-VIEW SUMMARY")
+print("="*100)
+
+detailed_view_data = []
+
+for view_name, view_data in all_test_results.items():
+    print(f"\n{'─'*100}")
+    print(f"VIEW: {view_name}")
+    print(f"Overall Status: {create_status_emoji(view_data['overall_status'])} {view_data['overall_status']}")
+    print(f"{'─'*100}")
+    
+    for i in range(1, 9):
+        test_key = test_keys[i-1]
+        test_data = view_data[test_key]
+        
+        status_emoji = create_status_emoji(test_data['status'])
+        print(f"\n  Test {i}: {test_data['test_name']}")
+        print(f"  Status: {status_emoji} {test_data['status']}")
+        
+        detail_row = {
+            'View_Name': view_name,
+            'Overall_Status': view_data['overall_status'],
+            'Test_Number': i,
+            'Test_Name': test_data['test_name'],
+            'Test_Status': test_data['status'],
+            'Details': '',
+            'Evidence_Sheet': ''
+        }
+        
+        # Build details for each test
+        if i == 1:  # Existence
+            details_parts = [
+                f"Redshift: {'✓ Accessible' if test_data.get('redshift_exists') else '✗ Not Found'}",
+                f"Databricks: {'✓ Accessible' if test_data.get('databricks_exists') else '✗ Not Found'}"
+            ]
+            detail_row['Details'] = '\n'.join(details_parts)
+            detail_row['Evidence_Sheet'] = 'Evidence_Test1_Existence'
+        
+        elif i == 2:  # Column Names
+            rs_only = test_data.get('redshift_only', [])
+            db_only = test_data.get('databricks_only', [])
+            details_parts = [
+                f"Common: {test_data.get('common_columns', 0)}",
+                f"RS Only: {len(rs_only)}" + (f" ({', '.join(rs_only[:3])}...)" if len(rs_only) > 3 else f" ({', '.join(rs_only)})" if rs_only else ""),
+                f"DB Only: {len(db_only)}" + (f" ({', '.join(db_only[:3])}...)" if len(db_only) > 3 else f" ({', '.join(db_only)})" if db_only else "")
+            ]
+            detail_row['Details'] = '\n'.join(details_parts)
+            detail_row['Evidence_Sheet'] = 'Evidence_Test2_Columns'
+        
+        elif i == 3:  # Data Types
+            mismatches = test_data.get('mismatch_count', 0)
+            warnings = test_data.get('warning_count', 0)
+            details_parts = [
+                f"Types Checked: {test_data.get('types_checked', 0)}",
+                f"Mismatches: {mismatches}",
+                f"Valid Conversions: {warnings}"
+            ]
+            detail_row['Details'] = '\n'.join(details_parts)
+            detail_row['Evidence_Sheet'] = 'Evidence_Test3_DataTypes'
+        
+        elif i == 4:  # Nullability Constraint
+            mismatches = test_data.get('mismatch_count', 0)
+            details_parts = [
+                f"Columns Checked: {test_data.get('columns_checked', 0)}",
+                f"Constraint Mismatches: {mismatches}"
+            ]
+            detail_row['Details'] = '\n'.join(details_parts)
+            detail_row['Evidence_Sheet'] = 'Evidence_Test4_NullConstraint'
+        
+        elif i == 5:  # Nullability Analysis
+            cols_checked = test_data.get('columns_checked', 0)
+            details_parts = [
+                f"Columns Checked: {cols_checked}",
+                f"Status: {test_data['status']}"
+            ]
+            detail_row['Details'] = '\n'.join(details_parts)
+            detail_row['Evidence_Sheet'] = 'Evidence_Test5_NullAnalysis'
+        
+        elif i == 6:  # Ordinal Position
+            mismatches = test_data.get('mismatch_count', 0)
+            details_parts = [
+                f"Positions Checked: {test_data.get('positions_checked', 0)}",
+                f"Mismatches: {mismatches}"
+            ]
+            detail_row['Details'] = '\n'.join(details_parts)
+            detail_row['Evidence_Sheet'] = 'Evidence_Test6_Position'
+        
+        elif i == 7:  # Row Count
+            row_count_periods = test_data.get('row_count_periods', {})
+            details_parts = ["Multi-Period Row Count:"]
+            
+            if 'main_period' in row_count_periods:
+                main = row_count_periods['main_period']
+                details_parts.append(f"Main: RS={main.get('redshift_count', 0):,}, DB={main.get('databricks_count', 0):,}, Diff={main.get('difference_percentage', 0):.2f}%")
+            
+            detail_row['Details'] = '\n'.join(details_parts)
+            detail_row['Evidence_Sheet'] = 'Evidence_Test7_RowCount'
+        
+        elif i == 8:  # Business Metrics
+            if test_data['status'] == 'SKIPPED':
+                details_parts = ["SKIPPED: No metrics defined"]
+            else:
+                metrics_tested = test_data.get('metrics_tested', 0)
+                details_parts = [
+                    f"Metrics Tested: {metrics_tested}",
+                    f"Status: {test_data['status']}"
+                ]
+            detail_row['Details'] = '\n'.join(details_parts)
+            detail_row['Evidence_Sheet'] = 'Evidence_Test8_Metrics'
+        
+        detailed_view_data.append(detail_row)
+
+# ============================================
+# 6. CRITICAL ISSUES
+# ============================================
+
+print(f"\n\n📛 CRITICAL ISSUES (FAILURES & ERRORS)")
+print("-"*100)
+
+critical_issues = []
+
+for view_name, view_data in all_test_results.items():
+    for i in range(1, 9):
+        test_key = test_keys[i-1]
+        test_data = view_data[test_key]
+        
+        if test_data['status'] in ['FAIL', 'ERROR']:
+            critical_issues.append({
+                'View_Name': view_name,
+                'Test_Name': test_data['test_name'],
+                'Status': test_data['status'],
+                'Priority': 'HIGH',
+                'Issue_Description': f"Test failed with status: {test_data['status']}"
+            })
+
+if critical_issues:
+    print(f"🚨 {len(critical_issues)} CRITICAL ISSUES FOUND!")
+    for issue in critical_issues[:10]:
+        print(f"   - {issue['View_Name']}: {issue['Test_Name']} = {issue['Status']}")
+else:
+    print(f"✅ NO CRITICAL ISSUES!")
+
+# ============================================
+# 7. WARNINGS
+# ============================================
+
+print(f"\n\n⚠️  WARNINGS")
+print("-"*100)
+
+warnings = []
+
+for view_name, view_data in all_test_results.items():
+    for i in range(1, 9):
+        test_key = test_keys[i-1]
+        test_data = view_data[test_key]
+        
+        if test_data['status'] == 'WARN':
+            warnings.append({
+                'View_Name': view_name,
+                'Test_Name': test_data['test_name'],
+                'Warning_Type': 'Minor Issue'
+            })
+
+if warnings:
+    print(f"⚠️  {len(warnings)} WARNINGS FOUND!")
+    for warning in warnings[:10]:
+        print(f"   - {warning['View_Name']}: {warning['Test_Name']}")
+else:
+    print(f"✅ NO WARNINGS!")
+
+# ============================================
+# EXCEL REPORT GENERATION
+# ============================================
+
+print(f"\n\n{'='*100}")
+print("📊 GENERATING COMPREHENSIVE EXCEL REPORT")
+print(f"{'='*100}")
+
+timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+
+excel_filename = f"UAT_COMPLETE_REPORT_{timestamp}.xlsx"
+excel_path = f"/Workspace/Users/misalpravin2003@gmail.com/reports/UAT_Reports/{excel_filename}"
+
+print(f"\n📝 Excel Report Filename: {excel_filename}")
+print(f"📂 Excel Report Path: {excel_path}")
+
+try:
+    with pd.ExcelWriter(excel_path, engine='openpyxl') as writer:
+        
+        header_fill = PatternFill(start_color='4472C4', end_color='4472C4', fill_type='solid')
+        header_font = Font(bold=True, color='FFFFFF', size=11)
+        center_alignment = Alignment(horizontal='center', vertical='center', wrap_text=True)
+        
+        # ============================================
+        # SHEET 1: EXECUTIVE SUMMARY
+        # ============================================
+        print("\n📝 Writing Sheet 1: Executive Summary...")
+        
+        exec_summary_data = {
+            'Metric': [
+                'Start Time', 'End Time', 'Duration',
+                '', 'Source System', 'Target System',
+                '', 'Total Views Tested', 'Views Passed', 'Views Warned', 'Views Failed',
+                '', 'Pass Rate', 'Test Date Range'
+            ],
+            'Value': [
+                execution_summary['start_time'],
+                execution_summary['end_time'],
+                str(datetime.strptime(execution_summary['end_time'], '%Y-%m-%d %H:%M:%S') - 
+                    datetime.strptime(execution_summary['start_time'], '%Y-%m-%d %H:%M:%S')),
+                '',
+                f"{REDSHIFT_CATALOG}.{REDSHIFT_SCHEMA}",
+                f"{DATABRICKS_CATALOG}.{DATABRICKS_SCHEMA}",
+                '',
+                total_views,
+                f"{views_passed} ({views_passed/total_views*100:.1f}%)",
+                f"{views_warned} ({views_warned/total_views*100:.1f}%)",
+                f"{views_failed} ({views_failed/total_views*100:.1f}%)",
+                '',
+                f"{views_passed/total_views*100:.1f}%",
+                f"{START_DATE} to {END_DATE}"
+            ]
+        }
+        
+        exec_summary_df = pd.DataFrame(exec_summary_data)
+        exec_summary_df.to_excel(writer, sheet_name='Executive_Summary', index=False)
+        ws = writer.sheets['Executive_Summary']
+        
+        ws.column_dimensions['A'].width = 30
+        ws.column_dimensions['B'].width = 50
+        
+        for cell in ws[1]:
+            cell.fill = header_fill
+            cell.font = header_font
+            cell.alignment = center_alignment
+        
+        for row in ws.iter_rows(min_row=2, max_row=ws.max_row):
+            for cell in row:
+                cell.alignment = center_alignment
+        
+        view_list_start_row = ws.max_row + 3
+        ws.cell(row=view_list_start_row, column=1, value='View Name')
+        ws.cell(row=view_list_start_row, column=2, value='Overall Status')
+        
+        ws.cell(row=view_list_start_row, column=1).fill = header_fill
+        ws.cell(row=view_list_start_row, column=1).font = header_font
+        ws.cell(row=view_list_start_row, column=2).fill = header_fill
+        ws.cell(row=view_list_start_row, column=2).font = header_font
+        
+        for idx, (view_name, view_data) in enumerate(all_test_results.items(), 1):
+            ws.cell(row=view_list_start_row + idx, column=1, value=view_name)
+            ws.cell(row=view_list_start_row + idx, column=2, value=f"{create_status_emoji(view_data['overall_status'])} {view_data['overall_status']}")
+        
+        print("   ✅ Executive Summary written successfully")
+        
+        # ============================================
+        # SHEET 2: TEST BREAKDOWN
+        # ============================================
+        print("📝 Writing Sheet 2: Test Breakdown...")
+        test_breakdown_df = pd.DataFrame(test_breakdown_data)
+        test_breakdown_df.to_excel(writer, sheet_name='Test_Breakdown', index=False)
+        ws = writer.sheets['Test_Breakdown']
+        
+        for col in range(1, 14):
+            ws.column_dimensions[get_column_letter(col)].width = 15
+        
+        for cell in ws[1]:
+            cell.fill = header_fill
+            cell.font = header_font
+            cell.alignment = center_alignment
+        
+        for row in ws.iter_rows(min_row=2, max_row=ws.max_row):
+            for cell in row:
+                cell.alignment = center_alignment
+        
+        print("   ✅ Test Breakdown written successfully")
+        
+        # ============================================
+        # SHEET 3: TEST MATRIX
+        # ============================================
+        print("📝 Writing Sheet 3: Test Matrix...")
+        matrix_df.to_excel(writer, sheet_name='Test_Matrix', index=False)
+        ws = writer.sheets['Test_Matrix']
+        
+        ws.column_dimensions['A'].width = 35
+        for col in ['B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J']:
+            ws.column_dimensions[col].width = 12
+        
+        for cell in ws[1]:
+            cell.fill = header_fill
+            cell.font = header_font
+            cell.alignment = center_alignment
+        
+        for row in ws.iter_rows(min_row=2, max_row=ws.max_row):
+            for cell in row:
+                cell.alignment = center_alignment
+        
+        print("   ✅ Test Matrix written successfully")
+        
+        # ============================================
+        # SHEET 4: DETAILED RESULTS
+        # ============================================
+        print("📝 Writing Sheet 4: Detailed Results...")
+        detailed_df = pd.DataFrame(detailed_view_data)
+        detailed_df.to_excel(writer, sheet_name='Detailed_Results', index=False)
+        ws = writer.sheets['Detailed_Results']
+        
+        ws.column_dimensions['A'].width = 30
+        ws.column_dimensions['B'].width = 15
+        ws.column_dimensions['C'].width = 12
+        ws.column_dimensions['D'].width = 25
+        ws.column_dimensions['E'].width = 15
+        ws.column_dimensions['F'].width = 60
+        ws.column_dimensions['G'].width = 30
+        
+        for cell in ws[1]:
+            cell.fill = header_fill
+            cell.font = header_font
+            cell.alignment = center_alignment
+        
+        for row_idx in range(2, ws.max_row + 1):
+            evidence_cell = ws.cell(row=row_idx, column=7)
+            sheet_name = evidence_cell.value
+            
+            if sheet_name:
+                evidence_cell.hyperlink = f"#{sheet_name}!A1"
+                evidence_cell.font = Font(color='0000FF', underline='single')
+                evidence_cell.alignment = Alignment(horizontal='center', vertical='center')
+            
+            details_cell = ws.cell(row=row_idx, column=6)
+            details_cell.alignment = Alignment(vertical='top', wrap_text=True)
+        
+        for row in ws.iter_rows(min_row=2, max_row=ws.max_row):
+            for col_idx, cell in enumerate(row, 1):
+                if col_idx not in [6, 7]:
+                    cell.alignment = center_alignment
+        
+        print("   ✅ Detailed Results written successfully")
+        
+        # ============================================
+        # SHEET 5: CRITICAL ISSUES
+        # ============================================
+        print("📝 Writing Sheet 5: Critical Issues...")
+        if critical_issues:
+            critical_df = pd.DataFrame(critical_issues)
+            critical_df.to_excel(writer, sheet_name='Critical_Issues', index=False)
+        else:
+            no_issues_df = pd.DataFrame({'Message': ['No critical issues found! 🎉']})
+            no_issues_df.to_excel(writer, sheet_name='Critical_Issues', index=False)
+        
+        ws = writer.sheets['Critical_Issues']
+        
+        for col in ['A', 'B', 'C', 'D']:
+            ws.column_dimensions[col].width = 20
+
+        if critical_issues:
+            ws.column_dimensions['E'].width = 50
+        
+        for cell in ws[1]:
+            cell.fill = header_fill
+            cell.font = header_font
+            cell.alignment = center_alignment
+        
+        for row in ws.iter_rows(min_row=2, max_row=ws.max_row):
+            for cell in row:
+                cell.alignment = center_alignment
+        
+        print("   ✅ Critical Issues written successfully")
+        
+        # ============================================
+        # SHEET 6: WARNINGS
+        # ============================================
+        print("📝 Writing Sheet 6: Warnings...")
+        if warnings:
+            warnings_df = pd.DataFrame(warnings)
+            warnings_df.to_excel(writer, sheet_name='Warnings', index=False)
+        else:
+            no_warnings_df = pd.DataFrame({'Message': ['No warnings found!']})
+            no_warnings_df.to_excel(writer, sheet_name='Warnings', index=False)
+        
+        ws = writer.sheets['Warnings']
+        
+        for col in ['A', 'B']:
+            ws.column_dimensions[col].width = 20
+
+        if warnings:
+            ws.column_dimensions['C'].width = 50
+        
+        for cell in ws[1]:
+            cell.fill = header_fill
+            cell.font = header_font
+            cell.alignment = center_alignment
+        
+        for row in ws.iter_rows(min_row=2, max_row=ws.max_row):
+            for cell in row:
+                cell.alignment = center_alignment
+        
+        print("   ✅ Warnings written successfully")
+
+        # ============================================
+        # SHEET 7: SIGN-OFF STATUS
+        # ============================================
+        print("📝 Writing Sheet 7: Sign-Off Status...")
+        signoff_data = {
+            'Criteria': [
+                'All Views Tested', 'Critical Issues', 'Warnings',
+                'Overall Pass Rate', '', 'Sign-Off Status', 'Recommendation'
+            ],
+            'Status': [
+                f'{total_views} views',
+                f'{len(critical_issues)} issues',
+                f'{len(warnings)} warnings',
+                f'{views_passed/total_views*100:.1f}%', '',
+                '✅ READY' if views_failed == 0 and views_warned <= 2 else '❌ NOT READY',
+                'Proceed to client sign-off' if views_failed == 0 and views_warned <= 2 else 'Fix critical issues before sign-off'
+            ]
+        }
+        signoff_df = pd.DataFrame(signoff_data)
+        signoff_df.to_excel(writer, sheet_name='SignOff_Status', index=False)
+        ws = writer.sheets['SignOff_Status']
+        
+        for col in ['A', 'B']:
+            ws.column_dimensions[col].width = 30
+        
+        for cell in ws[1]:
+            cell.fill = header_fill
+            cell.font = header_font
+            cell.alignment = center_alignment
+        
+        for row in ws.iter_rows(min_row=2, max_row=ws.max_row, min_col=1, max_col=2):
+            for cell in row:
+                cell.alignment = center_alignment
+        
+        print("   ✅ Sign-Off Status written successfully")
+        
+        # ============================================
+        # EVIDENCE SHEETS (8-15) - FOR 8 TESTS
+        # UPDATED FOR FULL OUTER JOIN STRUCTURE
+        # ✨ SHEET 10 NOW HAS DDL VALIDATION COLUMNS
+        # ============================================
+        
+        print("\n📊 Creating Evidence Sheets (8-15)...")
+        
+        # SHEET 8: TEST 1 EVIDENCE
+        print("   Creating Evidence Sheet 8: Test 1 (Existence)...")
+        existence_evidence = []
+        
+        for view_name, view_data in all_test_results.items():
+            test_data = view_data['test_1_existence']
+            existence_evidence.append({
+                'View_Name': view_name,
+                'Test_Status': test_data['status'],
+                'Redshift_Path': f"{REDSHIFT_CATALOG}.{REDSHIFT_SCHEMA}.{view_name}",
+                'Redshift_Exists': 'Yes' if test_data.get('redshift_exists') else 'No',
+                'Databricks_Path': f"{DATABRICKS_CATALOG}.{DATABRICKS_SCHEMA}.{view_name}",
+                'Databricks_Exists': 'Yes' if test_data.get('databricks_exists') else 'No',
+                'Can_Proceed': 'Yes' if test_data.get('can_proceed') else 'No'
+            })
+        
+        existence_df = pd.DataFrame(existence_evidence)
+        existence_df.to_excel(writer, sheet_name='Evidence_Test1_Existence', index=False)
+        ws = writer.sheets['Evidence_Test1_Existence']
+        
+        for col_letter in ['A', 'B', 'C', 'D', 'E', 'F', 'G']:
+            ws.column_dimensions[col_letter].width = 25
+        
+        for cell in ws[1]:
+            cell.fill = header_fill
+            cell.font = header_font
+            cell.alignment = center_alignment
+        
+        for row in ws.iter_rows(min_row=2, max_row=ws.max_row):
+            for cell in row:
+                cell.alignment = center_alignment
+        
+        # SHEET 9: TEST 2 EVIDENCE (Columns)
+        print("   Creating Evidence Sheet 9: Test 2 (Columns)...")
+        columns_evidence = []
+        
+        for view_name, view_data in all_test_results.items():
+            test_data = view_data['test_2_column_names']
+            
+            rs_only_set = set(test_data.get('redshift_only', []))
+            db_only_set = set(test_data.get('databricks_only', []))
+            
+            rs_schema_cols = set()
+            db_schema_cols = set()
+            if test_data.get('rs_schema'):
+                rs_schema_cols = set([row.get('col_name', '') for row in test_data.get('rs_schema', [])])
+            if test_data.get('db_schema'):
+                db_schema_cols = set([row.get('col_name', '') for row in test_data.get('db_schema', [])])
+            
+            common_set = rs_schema_cols & db_schema_cols
+            
+            all_columns = rs_only_set | db_only_set | common_set
+            
+            for col_name in sorted(all_columns):
+                in_redshift = col_name not in db_only_set
+                in_databricks = col_name not in rs_only_set
+                is_common = col_name in common_set
+                
+                if col_name in rs_only_set:
+                    missing_from = 'Databricks'
+                    extra_in = 'Redshift'
+                elif col_name in db_only_set:
+                    missing_from = 'Redshift'
+                    extra_in = 'Databricks'
+                else:
+                    missing_from = '-'
+                    extra_in = '-'
+                
+                columns_evidence.append({
+                    'View_Name': view_name,
+                    'Column_Name': col_name,
+                    'In_Redshift': 'Yes' if in_redshift else 'No',
+                    'In_Databricks': 'Yes' if in_databricks else 'No',
+                    'Common_Column': 'Yes' if is_common else 'No',
+                    'Missing_From': missing_from,
+                    'Extra_In': extra_in,
+                    'Test_Status': test_data['status']
+                })
+        
+        if columns_evidence:
+            columns_df = pd.DataFrame(columns_evidence)
+        else:
+            columns_df = pd.DataFrame({'Message': ['No column data available']})
+        
+        columns_df.to_excel(writer, sheet_name='Evidence_Test2_Columns', index=False)
+        ws = writer.sheets['Evidence_Test2_Columns']
+        
+        for col_letter in ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H']:
+            ws.column_dimensions[col_letter].width = 20
+        
+        for cell in ws[1]:
+            cell.fill = header_fill
+            cell.font = header_font
+            cell.alignment = center_alignment
+        
+        for row in ws.iter_rows(min_row=2, max_row=ws.max_row):
+            for cell in row:
+                cell.alignment = center_alignment
+        
+        # ============================================
+        # ✨ SHEET 10: TEST 3 EVIDENCE (Data Types)
+        # NOW WITH DDL VALIDATION COLUMNS
+        # ============================================
+        print("   Creating Evidence Sheet 10: Test 3 (Data Types) - WITH DDL VALIDATION...")
+        datatype_evidence = []
+        
+        for view_name, view_data in all_test_results.items():
+            test_data = view_data['test_3_data_types']
+            
+            type_comparison = test_data.get('type_comparison', [])
+            for comp in type_comparison:
+                datatype_evidence.append({
+                    'View_Name': view_name,
+                    'Test_Status': test_data['status'],
+                    'Column_Name': comp['Column Name'],
+                    'Redshift_Column': comp['Redshift Column'],
+                    'Redshift_Type': comp['Redshift Type'],
+                    'Databricks_Column': comp['Databricks Column'],
+                    'Databricks_Type': comp['Databricks Type'],
+                    'Compatibility': comp['Compatibility'],  # ✅ EXACT, ✅ EQUIVALENT, ❌ MISMATCH, ❌ MISSING
+                    'Match_Type': comp['Match Type'],        # exact, equivalent, mismatch, missing
+                    'Explanation': comp['Explanation']       # Detailed explanation
+                })
+        
+        if datatype_evidence:
+            datatype_df = pd.DataFrame(datatype_evidence)
+        else:
+            datatype_df = pd.DataFrame({'Message': ['No data type comparisons available']})
+        
+        datatype_df.to_excel(writer, sheet_name='Evidence_Test3_DataTypes', index=False)
+        ws = writer.sheets['Evidence_Test3_DataTypes']
+        
+        # Adjust column widths (now 10 columns instead of 8)
+        for col_letter in ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J']:
+            ws.column_dimensions[col_letter].width = 22
+        
+        # Header formatting
+        for cell in ws[1]:
+            cell.fill = header_fill
+            cell.font = header_font
+            cell.alignment = center_alignment
+        
+        # Apply color coding based on Compatibility status
+        green_fill = PatternFill(start_color='90EE90', end_color='90EE90', fill_type='solid')  # Light green
+        yellow_fill = PatternFill(start_color='FFFF00', end_color='FFFF00', fill_type='solid')  # Yellow
+        red_fill = PatternFill(start_color='FFB6C1', end_color='FFB6C1', fill_type='solid')     # Light red
+        
+        for row_idx in range(2, ws.max_row + 1):
+            compatibility_cell = ws.cell(row=row_idx, column=8)  # Compatibility column
+            compatibility_value = str(compatibility_cell.value)
+            
+            if '✅ EXACT' in compatibility_value:
+                # Green for exact matches
+                for col_idx in range(1, 11):
+                    ws.cell(row=row_idx, column=col_idx).fill = green_fill
+            elif '✅ EQUIVALENT' in compatibility_value:
+                # Light green or white for equivalent (valid conversions)
+                # No fill - keep white to distinguish from exact
+                pass
+            elif '❌ MISMATCH' in compatibility_value:
+                # Red for actual mismatches
+                for col_idx in range(1, 11):
+                    ws.cell(row=row_idx, column=col_idx).fill = red_fill
+            elif '❌ MISSING' in compatibility_value:
+                # Yellow for missing columns
+                for col_idx in range(1, 11):
+                    ws.cell(row=row_idx, column=col_idx).fill = yellow_fill
+        
+        # Center align all cells
+        for row in ws.iter_rows(min_row=2, max_row=ws.max_row):
+            for cell in row:
+                cell.alignment = center_alignment
+        
+        print("   ✅ Test 3 Evidence created (WITH DDL VALIDATION)")
+        
+        # ============================================
+        # Continue with remaining evidence sheets...
+        # ============================================
+        
+        # SHEET 11: TEST 4 EVIDENCE (Nullability Constraint) - UPDATED FOR FULL OUTER JOIN
+        print("   Creating Evidence Sheet 11: Test 4 (Nullability Constraint)...")
+        null_constraint_evidence = []
+        
+        for view_name, view_data in all_test_results.items():
+            test_data = view_data['test_4_nullability_constraint']
+            
+            nullable_comparison = test_data.get('nullable_comparison', [])
+            for nc in nullable_comparison:
+                null_constraint_evidence.append({
+                    'View_Name': view_name,
+                    'Test_Status': test_data['status'],
+                    'Column_Name': nc['Column Name'],
+                    'Redshift_Column': nc['Redshift Column'],
+                    'Redshift_IS_NULLABLE': nc['Redshift IS_NULLABLE'],
+                    'Databricks_Column': nc['Databricks Column'],
+                    'Databricks_IS_NULLABLE': nc['Databricks IS_NULLABLE'],
+                    'Match': nc['Match']
+                })
+        
+        if null_constraint_evidence:
+            null_constraint_df = pd.DataFrame(null_constraint_evidence)
+        else:
+            null_constraint_df = pd.DataFrame({'Message': ['Nullability constraint check completed']})
+        
+        null_constraint_df.to_excel(writer, sheet_name='Evidence_Test4_NullConstraint', index=False)
+        ws = writer.sheets['Evidence_Test4_NullConstraint']
+        
+        for col_letter in ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H']:
+            ws.column_dimensions[col_letter].width = 25
+        
+        for cell in ws[1]:
+            cell.fill = header_fill
+            cell.font = header_font
+            cell.alignment = center_alignment
+        
+        for row in ws.iter_rows(min_row=2, max_row=ws.max_row):
+            for cell in row:
+                cell.alignment = center_alignment
+        
+        # SHEET 12: TEST 5 EVIDENCE (Nullability Analysis) - UPDATED FOR FULL OUTER JOIN
+        print("   Creating Evidence Sheet 12: Test 5 (Nullability Analysis)...")
+        nullability_evidence = []
+        
+        for view_name, view_data in all_test_results.items():
+            test_data = view_data['test_5_nullability_analysis']
+            
+            for nc in test_data.get('nullability_comparison', []):
+                nullability_evidence.append({
+                    'View_Name': view_name,
+                    'Test_Status': test_data['status'],
+                    'Column': nc['Column'],
+                    'Redshift_Column': nc['Redshift Column'],
+                    'Redshift_NULLs': nc['Redshift NULLs'],
+                    'Databricks_Column': nc['Databricks Column'],
+                    'Databricks_NULLs': nc['Databricks NULLs'],
+                    'Difference': nc['Difference'],
+                    'Status': nc['Status']
+                })
+        
+        if nullability_evidence:
+            nullability_df = pd.DataFrame(nullability_evidence)
+        else:
+            nullability_df = pd.DataFrame({'Message': ['Nullability analysis completed']})
+        
+        nullability_df.to_excel(writer, sheet_name='Evidence_Test5_NullAnalysis', index=False)
+        ws = writer.sheets['Evidence_Test5_NullAnalysis']
+        
+        for col_letter in ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I']:
+            ws.column_dimensions[col_letter].width = 20
+        
+        for cell in ws[1]:
+            cell.fill = header_fill
+            cell.font = header_font
+            cell.alignment = center_alignment
+        
+        for row in ws.iter_rows(min_row=2, max_row=ws.max_row):
+            for cell in row:
+                cell.alignment = center_alignment
+        
+        # SHEET 13: TEST 6 EVIDENCE (Ordinal Position) - UPDATED FOR FULL OUTER JOIN
+        print("   Creating Evidence Sheet 13: Test 6 (Ordinal Position)...")
+        position_evidence = []
+        
+        for view_name, view_data in all_test_results.items():
+            test_data = view_data['test_6_ordinal_position']
+            
+            position_comparison = test_data.get('position_comparison', [])
+            for comp in position_comparison:
+                position_evidence.append({
+                    'View_Name': view_name,
+                    'Test_Status': test_data['status'],
+                    'Column_Name': comp['Column Name'],
+                    'Redshift_Column': comp['Redshift Column'],
+                    'Redshift_Position': comp['Redshift Position'],
+                    'Databricks_Column': comp['Databricks Column'],
+                    'Databricks_Position': comp['Databricks Position'],
+                    'Difference': comp['Difference'],
+                    'Match': comp['Match']
+                })
+        
+        if position_evidence:
+            position_df = pd.DataFrame(position_evidence)
+        else:
+            position_df = pd.DataFrame({'Message': ['All columns in same order across all views!']})
+        
+        position_df.to_excel(writer, sheet_name='Evidence_Test6_Position', index=False)
+        ws = writer.sheets['Evidence_Test6_Position']
+        
+        for col_letter in ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I']:
+            ws.column_dimensions[col_letter].width = 20
+        
+        for cell in ws[1]:
+            cell.fill = header_fill
+            cell.font = header_font
+            cell.alignment = center_alignment
+        
+        for row in ws.iter_rows(min_row=2, max_row=ws.max_row):
+            for cell in row:
+                cell.alignment = center_alignment
+        
+        # SHEET 14: TEST 7 EVIDENCE (Row Count)
+        print("   Creating Evidence Sheet 14: Test 7 (Row Count)...")
+        rowcount_evidence = []
+        
+        for view_name, view_data in all_test_results.items():
+            test_data = view_data['test_7_row_count']
+            row_count_periods = test_data.get('row_count_periods', {})
+            
+            for period_key in ['main_period', 'one_month', 'six_months', 'one_year', 'three_year']:
+                if period_key in row_count_periods:
+                    period_data = row_count_periods[period_key]
+                    if period_data.get('status') != 'SKIPPED':
+                        rowcount_evidence.append({
+                            'View_Name': view_name,
+                            'Period_Name': period_data.get('period_name', period_key.replace('_', ' ').title()),
+                            'Period_Date_Range': period_data.get('period_label', 'N/A'),
+                            'Test_Status': period_data.get('status', 'N/A'),
+                            'Redshift_Count': period_data.get('redshift_count', 0),
+                            'Databricks_Count': period_data.get('databricks_count', 0),
+                            'Difference': period_data.get('difference', 0),
+                            'Difference_Pct': f"{period_data.get('difference_percentage', 0):.2f}%"
+                        })
+        
+        if rowcount_evidence:
+            rowcount_df = pd.DataFrame(rowcount_evidence)
+        else:
+            rowcount_df = pd.DataFrame({'Message': ['No row count data available']})
+        
+        rowcount_df.to_excel(writer, sheet_name='Evidence_Test7_RowCount', index=False)
+        ws = writer.sheets['Evidence_Test7_RowCount']
+        
+        for col_letter in ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H']:
+            ws.column_dimensions[col_letter].width = 22
+        
+        for cell in ws[1]:
+            cell.fill = header_fill
+            cell.font = header_font
+            cell.alignment = center_alignment
+        
+        for row in ws.iter_rows(min_row=2, max_row=ws.max_row):
+            for cell in row:
+                cell.alignment = center_alignment
+        
+        # SHEET 15: TEST 8 EVIDENCE (Business Metrics)
+        print("   Creating Evidence Sheet 15: Test 8 (Business Metrics)...")
+        metrics_evidence = []
+        
+        for view_name, view_data in all_test_results.items():
+            test_data = view_data['test_8_business_metrics']
+            
+            for mr in test_data.get('metrics_results', []):
+                metrics_evidence.append({
+                    'View_Name': view_name,
+                    'Test_Status': test_data['status'],
+                    'Metric': mr['Metric'],
+                    'Aggregation': mr['Aggregation'],
+                    'Redshift_Value': mr['Redshift'],
+                    'Databricks_Value': mr['Databricks'],
+                    'Difference': mr['Diff'],
+                    'Difference_Pct': mr['Diff %'],
+                    'Match_Status': mr['Status']
+                })
+        
+        if metrics_evidence:
+            metrics_df = pd.DataFrame(metrics_evidence)
+        else:
+            metrics_df = pd.DataFrame({'Message': ['No business metrics defined for tested views']})
+        
+        metrics_df.to_excel(writer, sheet_name='Evidence_Test8_Metrics', index=False)
+        ws = writer.sheets['Evidence_Test8_Metrics']
+        
+        for col_letter in ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I']:
+            ws.column_dimensions[col_letter].width = 18
+        
+        for cell in ws[1]:
+            cell.fill = header_fill
+            cell.font = header_font
+            cell.alignment = center_alignment
+        
+        for row in ws.iter_rows(min_row=2, max_row=ws.max_row):
+            for cell in row:
+                cell.alignment = center_alignment
+        
+        print("   ✅ All evidence sheets created")
+
+    print(f"\n✅ Complete Excel Report saved successfully!")
+    print(f"\n📊 File Location: {excel_path}")
+    print(f"\n📋 Excel Report Contains 15 Sheets:")
+    print(f"\n   OVERVIEW SHEETS (1-7):")
+    print(f"   - Sheet 1:  Executive Summary")
+    print(f"   - Sheet 2:  Test Breakdown")
+    print(f"   - Sheet 3:  Test Matrix")
+    print(f"   - Sheet 4:  Detailed Results (with clickable hyperlinks to evidence)")
+    print(f"   - Sheet 5:  Critical Issues")
+    print(f"   - Sheet 6:  Warnings")
+    print(f"   - Sheet 7:  Sign-Off Status")
+    print(f"\n   EVIDENCE SHEETS (8-15) - Complete Proof:")
+    print(f"   - Sheet 8:  Evidence_Test1_Existence")
+    print(f"   - Sheet 9:  Evidence_Test2_Columns")
+    print(f"   - Sheet 10: Evidence_Test3_DataTypes (✨ WITH DDL VALIDATION)")
+    print(f"   - Sheet 11: Evidence_Test4_NullConstraint (FULL OUTER JOIN)")
+    print(f"   - Sheet 12: Evidence_Test5_NullAnalysis (FULL OUTER JOIN)")
+    print(f"   - Sheet 13: Evidence_Test6_Position (FULL OUTER JOIN)")
+    print(f"   - Sheet 14: Evidence_Test7_RowCount (Multi-Period)")
+    print(f"   - Sheet 15: Evidence_Test8_Metrics")
+
+except Exception as e:
+    print(f"\n❌ ERROR: Failed to create Excel report!")
+    print(f"   Error details: {str(e)}")
+    print(f"   File was NOT saved: {excel_path}")
+
+print("\n" + "="*100)
+print("🎉 END OF UAT REPORT")
+print("="*100)
